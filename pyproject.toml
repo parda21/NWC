@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neural-weight-compression"
+version = "0.9.0"
+description = "NWC: lossless BF16 weight compression with a fused CUDA matvec that decodes in registers"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Paul Otto" }]
+keywords = ["llm", "cuda", "compression", "bf16", "inference", "pytorch", "lossless"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["torch>=2.4", "safetensors>=0.4"]
+
+[project.optional-dependencies]
+models = ["transformers>=4.45", "accelerate>=0.30"]
+
+[project.urls]
+Homepage = "https://github.com/parda21/NWC"
+Documentation = "https://github.com/parda21/NWC/tree/main/docs"
+
+[tool.setuptools]
+packages = ["nwc"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+nwc = ["lib/*.dll", "lib/*.so"]

@@ -1,0 +1,245 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{microtype}
+\hypersetup{colorlinks=true, linkcolor=blue!60!black, citecolor=blue!60!black, urlcolor=blue!60!black}
+
+\title{Neural Weight Compression: Lossless BF16 Weights Decoded Inside the Matrix--Vector Kernel}
+\author{Paul Otto\\ cloo GmbH\\ \texttt{https://github.com/parda21/NWC}}
+\date{September 2026 --- draft}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Token generation with large language models is bound by memory bandwidth: every weight is read once per
+token. We present NWC, a lossless compression scheme for BF16 weights that is decoded inside the
+matrix--vector kernel, in registers, so that no decompressed weight is ever written to memory. The
+mantissa byte of a BF16 weight carries 7.97 bits of entropy and is stored raw; the exponent/sign byte
+carries 2.6--2.9 bits and is coded with a frequency-ranked prefix code that a 4096-entry shared-memory
+lookup table decodes two symbols at a time. The compressed model is 31\,\% smaller and bit-exact.
+Because the fused kernel reads only the compressed bytes, it is faster than the uncompressed cuBLAS
+matvec on GPUs whose decoder throughput exceeds \emph{bandwidth}$\times$0.69: on an RTX~4070, Qwen3-4B
+generates 55 instead of 45 tokens/s at 5.67 instead of 8.10\,GB of VRAM with bit-identical logits; on a
+bandwidth-starved NVIDIA A16 (10 SMs) it generates 18.2 instead of 16.8 tokens/s. DFloat11, which
+compresses the same bits but decodes into a buffer before the matmul, takes 2.7$\times$ the native GPU
+time per token on the same hardware. We report the instruction-level cost model that made the in-kernel
+decoder fast enough on Ampere, and the negative results along the way.
+\end{abstract}
+
+\section{Introduction}
+
+Serving a transformer at batch size one is a sequence of matrix--vector products in which each weight is
+read exactly once. Time per token is therefore set by the number of bytes the memory system delivers, not
+by arithmetic. Quantization attacks the byte count by changing the weights; lossless compression attacks
+it without changing them, but only pays off if decompression does not itself become the bottleneck.
+Existing lossless approaches for LLM weights \cite{dfloat11,zipnn} decompress into a buffer that the
+subsequent matmul reads again, so the decompressed weights cross the memory system twice and batch-one
+latency gets worse, not better.
+
+NWC (Neural Weight Compression) takes the other route: the weights stay compressed in VRAM and are
+decoded inside the matvec kernel, in the registers of the thread that immediately multiplies them. The
+kernel reads 69\,\% of the bytes and never writes a decompressed weight. Whether this is a net win is a
+question of decoder throughput per streaming multiprocessor versus memory bandwidth; the contribution of
+this paper is a format and a decoder that win on consumer GDDR parts by a wide margin and, after a
+sequence of measured redesigns, also on an Ampere part with 10 SMs.
+
+Contributions: (1) a byte-plane format with a rank prefix code for the exponent byte whose compressed size
+matches the entropy limit within 1--2\,\%; (2) a fused CUDA decoder that needs 11--13 SM clocks per 64
+weights on Ampere, including a lookup-table design that yields two codes per shared-memory access and a
+bit-window refill without a counter; (3) an instruction-level cost model of the Ampere GA10x SM, measured
+rather than assumed, which predicted the wins and explains the losses; (4) end-to-end measurements on two
+GPUs with bit-exact checks, and a head-to-head comparison with DFloat11.
+
+\section{Related work}
+
+DFloat11 \cite{dfloat11} observes that the BF16 exponent is highly redundant and Huffman-codes it,
+reaching 70\,\% of the original size with bit-exact reconstruction; decoding runs in a separate kernel into
+a BF16 buffer, with hierarchical lookup tables in shared memory. ZipNN \cite{zipnn} applies byte-grouping
+and general-purpose entropy coding to checkpoints for storage and transfer. Both agree with our entropy
+measurement: the mantissa is incompressible, the exponent carries roughly three bits. Asymmetric numeral
+systems \cite{ans} were our first coder (formats v4--v8, Section~\ref{sec:history}); the final format uses a
+prefix code because its decoder needs no table gather per symbol. Weight quantization (INT4/INT8, FP8) is
+orthogonal: it changes the weights and trades quality for size, whereas NWC is lossless; the two can be
+combined only to the extent that quantized weights still carry redundancy, which they largely do not.
+
+\section{Method}
+
+\subsection{What is compressible}
+
+A BF16 value has one sign bit, eight exponent bits and seven mantissa bits. Over the linear layers of
+Qwen2.5 and Qwen3 models we measure 7.97 bits of entropy in the mantissa byte and 2.6--2.9 bits in the
+byte formed by sign and the upper seven exponent bits. Context modelling (neighbouring weights, row
+statistics, strided correlation) recovers less than 0.4\,\% and costs more in table traffic than it saves.
+The achievable size is therefore $(8 + 2.8)/16 \approx 0.68$ of BF16, and this bound is the same for every
+entropy coder; the design freedom is entirely in decoding cost.
+
+\subsection{Format}
+
+The exponent byte is mapped to its rank in the per-tensor frequency order. Rank $r < 15$ is written as
+$r$ zeros, a one, and the raw sign bit ($r+2$ bits); rank $\geq 15$ is an escape of 16 bits followed by
+the raw byte. The mean cost is 2.85--2.99 bits per weight on Qwen models (escapes 0.01--0.4\,\%); the rANS
+coder of earlier formats saved about 1\,\% of the exponent stream at roughly twice the decoding cost.
+
+The matrix is tiled into blocks of $8$ rows $\times$ $512$ columns. One warp decodes one block; lane $L$
+owns columns $16L \ldots 16L+15$ of all eight rows and has its own bit stream. Streams are packed into
+32-bit words, 32 streams per block, with a one-byte length per lane and a warp prefix sum for the offsets.
+Matrices of any shape are supported: the block grid is padded to multiples of 8 and 512, padding weights
+cost two bits and have no mantissa, and the mantissa plane is stored row-major with the row length
+rounded up to 16.
+
+\subsection{Decoder}
+
+\paragraph{Lookup table.} A table of 4096 32-bit entries, indexed by the next 12 bits of a lane's stream,
+holds for 98.9\,\% of the patterns two complete codes: the two exponent bytes and the total number of bits
+consumed, placed in the low byte so that the funnel-shift instruction can use the entry directly as its
+shift amount. Patterns without two complete codes are flagged and finished by a \texttt{clz}-based slow
+path (0.06--0.4\,\% of lane steps). The table lives in shared memory; the rank-to-exponent mapping is
+recovered from the table itself, so a block needs a single 16\,KB copy.
+
+\paragraph{Bit window.} Each lane keeps a 64-bit window. Advancing by $c$ bits is two funnel shifts. The
+fill level is tracked as a rotated power of two, $M = 2^{64-n_b} \bmod 2^{32}$, rotated left by $c$ each
+step; a wrap-around signals that fewer than 32 valid bits remain, and the pre-loaded next word $w$ is
+merged with a single wide multiply-add, $\mathit{hi{:}lo} \mathrel{+}= w \cdot M$, which is a no-op for
+lanes that did not wrap. Only the load of the following word is predicated.
+
+\paragraph{Weights and accumulation.} One \texttt{prmt} assembles the fp32 bit pattern of a weight from its
+exponent byte and its mantissa byte, using sign replication of a known-zero byte for the two zero bytes.
+The 16 activation values of a lane are loaded once per block into registers; each row is accumulated in
+a register and a transposed shuffle reduction at block end leaves the sum of row $r$ in lane $4r$. The
+kernel runs one persistent block of 1024 threads per SM. Dequantization and the embedding lookup for the
+tied output projection use the same decoder.
+
+\subsection{Cost model}
+\label{sec:cost}
+
+Nsight Compute was not available on the measurement machines, so the decoder was optimised against
+knock-out variants and a micro-benchmark of per-instruction issue cost. On the Ampere GA10x SM, with
+independent instruction chains and data-dependent operands (with constant operands \texttt{ptxas} folds
+the chains and reports twice the rate), we measure in SM clocks per warp instruction: FFMA 0.27;
+IADD3/LOP3 0.30; IMAD, IMAD.WIDE, SHF, ISETP, SEL, PRMT 0.51; IMAD.HI 1.0; FLO 2.0. IMAD and SHF overlap
+(0.26 when interleaved), as do SHF and IADD3; PRMT and IMAD.HI block both pipes. The issue limit of one
+instruction per clock per sub-partition bounds a 21-instruction step at 5.5 clocks; the measured 11--13
+clocks per 64 weights are consistent with the pipe costs plus the branch and memory instructions.
+
+Two effects dominated the path from 17.7 to 11.0 clocks (Table~\ref{tab:stages}): code size (a fully
+unrolled kernel with the slow path inline was 147\,KB and cost 3.5 clocks per step against a 23\,KB rolled
+loop), and moving the window arithmetic from the IMAD pipe to the shift pipe once the true issue rates
+were known.
+
+\section{Experiments}
+
+\subsection{Setup}
+
+RTX~4070 (12\,GB GDDR6X, 452\,GB/s measured, 46 SMs, CUDA 13.4) and an NVIDIA A16 in a vGPU 16Q profile
+(16\,GB GDDR6, 10 SMs, 2\,MB L2, cuBLAS reaches 160--165\,GB/s; CUDA 12.6, sm\_86). Model: Qwen3-4B in BF16
+via HF Transformers, with q/k/v and gate/up projections fused and the tied \texttt{lm\_head} compressed.
+Kernel times are medians of CUDA-event measurements with weight copies rotated against the L2; token
+rates are wall-clock over 256 greedy tokens with the decode step captured as a CUDA graph. Correctness is
+checked by bit-exact dequantization and gather tests for a range of shapes including $K = 11008, 3600,
+1000, 4097$ and $M = 1001, 13, 3$, and by comparing the generated token sequence with HF
+\texttt{generate}.
+
+\subsection{Results}
+
+\begin{table}[h]\centering
+\begin{tabular}{lll}\toprule
+ & RTX 4070 & NVIDIA A16 \\\midrule
+VRAM, native $\rightarrow$ NWC & 8.10 $\rightarrow$ 5.67\,GB & 8.10 $\rightarrow$ 5.67\,GB \\
+tokens/s, native $\rightarrow$ NWC & 45.0 $\rightarrow$ 55.2 & 16.8 $\rightarrow$ 18.2 \\
+GPU time per token, native $\rightarrow$ NWC & 20.4 $\rightarrow$ 18.9\,ms & 54.1 $\rightarrow$ 52.1\,ms \\
+weight kernels vs cuBLAS (5 shapes) & 1.17--1.55$\times$ & 1.06--1.18$\times$ \\
+logits vs native & bit-identical & max 0.20, argmax identical$^{a}$ \\
+token sequence vs HF generate (64) & identical & identical \\\bottomrule
+\end{tabular}
+\caption{Qwen3-4B, greedy decoding as a CUDA graph. $^{a}$cuBLAS itself differs by max 0.19 between the
+two GPUs (different fp32 summation order); the weights are bit-exact on both.}
+\end{table}
+
+\begin{table}[h]\centering
+\begin{tabular}{lrrrr}\toprule
+layer ($M \times K$) & 4070 cuBLAS / NWC & ratio & A16 cuBLAS / NWC & ratio \\\midrule
+qkv $6144 \times 2560$ & 0.117 / 0.100\,ms & 1.17 & 0.200 / 0.178\,ms & 1.12 \\
+o $2560 \times 4096$ & 0.086 / 0.073\,ms & 1.18 & 0.135 / 0.128\,ms & 1.06 \\
+gate\_up $19456 \times 2560$ & 0.252 / 0.163\,ms & 1.55 & 0.605 / 0.513\,ms & 1.18 \\
+down $2560 \times 9728$ & 0.146 / 0.110\,ms & 1.34 & 0.306 / 0.271\,ms & 1.13 \\
+lm\_head $151936 \times 2560$ & 1.675 / 1.241\,ms & 1.35 & 4.787 / 4.538\,ms & 1.06 \\
+sum per token & 23.4 / 17.3\,ms & 1.35 & 49.6 / 43.8\,ms & 1.13 \\\bottomrule
+\end{tabular}
+\caption{Per-layer matvec time versus cuBLAS.}
+\end{table}
+
+\subsection{Comparison with DFloat11}
+
+Same model (Qwen/Qwen3-4B and DFloat11/Qwen3-4B-DF11, dfloat11 0.5.0), same prompt, same profiler, RTX
+4070: native 20.4\,ms GPU time per token, DFloat11 56.1\,ms (2.74$\times$; its decode kernel alone takes
+36.6\,ms), NWC 18.9\,ms. VRAM 8.10 / 5.73 / 5.67\,GB. The size is the same because it is the entropy of the
+mantissa; the speed differs because DFloat11's decoded weights pass through memory twice.
+
+\subsection{Decoder stages and knockouts}
+\label{sec:history}
+
+\begin{table}[h]\centering
+\begin{tabular}{lrrl}\toprule
+stage & gate\_up & lm\_head & change \\\midrule
+v8 (rANS on exponent pairs, 64-bit state) & 17.7 & 18.3 & --- \\
+prefix code, 12-bit LUT, IMAD window & 17.5 & 19.8 & no table gather, INT pipe busy \\
+8$\times$512 block, activations in registers & 16.0 & 17.2 & no activation loads \\
+slow path out of line & 12.5 & 14.3 & code 147\,KB $\rightarrow$ 52\,KB \\
+row loop not unrolled & 12.5 & 14.0 & 23\,KB, slow path inline \\
+funnel-shift window, rotation fill level & 12.1 & 13.3 & work moved to the shift pipe \\
+L1 prefetch of the block stream & \textbf{11.0} & \textbf{12.6} & \\\bottomrule
+\end{tabular}
+\caption{SM clocks per warp step of 64 weights on the A16; parity with cuBLAS is 13.6.}
+\label{tab:stages}
+\end{table}
+
+Knockouts of the final kernel (gate\_up, 12.1 without prefetch): without the slow path 11.0, without
+refills 9.7, without the table access 10.9, floor 9.7. Variants that did not help: a warp-uniform branch
+via \texttt{\_\_any\_sync} ($+1$ clock), unrolling the row loop ($\pm 0$ / $+0.3$), 13/14-bit peeks
+(slower), IMAD.HI instead of SHF ($\pm 0$). Earlier, with rANS: 64-bit table entries ($+4\,\%$), four states
+per lane ($-5$ to $-15\,\%$), 8192-weight blocks (always slower: the streams of 32--40 warps thrash the
+L1), quad symbols (exponent bytes are nearly independent: 2.815 / 2.811 / 2.803 bits per weight for 1/2/4
+byte symbols).
+
+\subsection{Where it wins}
+
+The decoder delivers 7--8\,GB/s of compressed data per SM$\cdot$GHz (v8: 5.0, v6: 3.5--3.9). NWC is faster
+than native when this exceeds bandwidth $\times$ 0.69. For the 4070 and the 4080 Super this is satisfied by
+a factor of three (they are bandwidth-bound); for the A16 by 10--20\,\%; projected for an H100 PCIe
+(2\,TB/s) at 1.1--1.2$\times$ and for an H100 SXM (3.35\,TB/s) at 0.8--0.9$\times$, assuming Ampere issue
+rates. Closing the SXM gap requires 20\,\% fewer clocks per step; a tensor-core accumulation path in which
+one \texttt{prmt} produces the bf16x2 A-fragment of an \texttt{mma.m16n8k16} directly is the planned next
+step.
+
+\section{Limitations}
+
+Batch-one decoding is the fast path; prefill dequantizes into a temporary BF16 buffer and only saves
+memory. The gain is bounded by the byte ratio (at most 1/0.69) and realised only where the decoder keeps
+up with the memory system. Logits are bit-identical to the native computation only where the fp32
+summation order matches; otherwise they lie within the spread cuBLAS itself shows between GPUs.
+Measurements cover two GPUs and one model family; Hopper has not been measured.
+
+\section{Conclusion}
+
+Lossless weight compression does not have to cost latency. Decoding inside the matvec turns the 31\,\%
+size reduction into a speed-up on memory-bound hardware, provided the decoder is designed against the
+real instruction costs of the SM. The format, kernel, tests and every measurement in this paper are
+available under the Apache-2.0 license.
+
+\section*{Acknowledgements}
+This work was sponsored by cloo GmbH.
+
+\begin{thebibliography}{9}
+\bibitem{dfloat11} T.~Zhang, Y.~Sui, S.~Zhong, V.~Chaudhary, X.~Hu, A.~Shrivastava. 70\% Size, 100\% Accuracy:
+Lossless LLM Compression for Efficient GPU Inference via Dynamic-Length Float. arXiv:2504.11651, 2025.
+\bibitem{zipnn} M.~Hershcovitch et al. ZipNN: Lossless Compression for AI Models. arXiv:2411.05239, 2024.
+\bibitem{ans} J.~Duda. Asymmetric numeral systems: entropy coding combining speed of Huffman coding with
+compression rate of arithmetic coding. arXiv:1311.2540, 2013.
+\bibitem{qwen3} Qwen Team. Qwen3 Technical Report. arXiv:2505.09388, 2025.
+\end{thebibliography}
+
+\end{document}

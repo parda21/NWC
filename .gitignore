@@ -1,0 +1,13 @@
+build/
+data/
+models/
+__pycache__/
+*.pyc
+*.obj
+*.lib
+*.exp
+*.log
+nwc/lib/*.dll
+nwc/lib/*.so
+dist/
+*.egg-info/
