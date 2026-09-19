@@ -216,11 +216,11 @@ the 4070 bandwidth-bound (1.14× native fp8) and BF16 on the 4080 Super / 4090 m
 
 Model level, Qwen3-4B on the RTX 4070 (`python -m nwc.demo models/Qwen3-4B --fp8 --graph --tokens 128`):
 
-| | native BF16 | NWC (BF16, lossless) | fp8 weight-only, NWC-coded |
-|---|---|---|---|
-| linear weights | 8.04 GB | 5.55 GB | **3.54 GB** (0.88 of fp8, 0.44 of BF16) |
-| VRAM in use | 8.10 GB | 5.67 GB | **3.61 GB** |
-| tokens/s, CUDA graph, greedy | 45 | 55 | **73.6** |
+| | native BF16 | NWC (BF16, lossless) | native fp8, uncompressed (`--native-fp8`) | fp8 weight-only, NWC-coded |
+|---|---|---|---|---|
+| linear weights | 8.04 GB | 5.55 GB | 4.02 GB (+ BF16 tied lm_head) | **3.54 GB** (0.88 of fp8, 0.44 of BF16) |
+| VRAM in use | 8.10 GB | 5.67 GB | 4.44 GB | **3.61 GB** |
+| tokens/s, CUDA graph, greedy | 45 | 55 | 75.0 (A16: 25.8) | **73.6** (A16: 20.1, layout 1: 21.7) |
 | perplexity WikiText-2 (16 × 1024) | 18.03 | = native | 18.15 (+0.7 %, the fp8 quantization) |
 
 Quantized entropies (section 7) put the ceiling for fp8 at 0.828 with an ideal coder on the 4-bit exponent;

@@ -101,13 +101,18 @@ recipe vLLM & co. serve) and stores the fp8 values lossless. Qwen3-4B, CUDA grap
 library's own fp8 weight-only matvec, which reads one byte per weight at the memory bandwidth
 ([docs/results.md](docs/results.md), section 8):
 
-| | RTX 4070 | NVIDIA A16 |
-|---|---|---|
-| VRAM, native BF16 → NWC fp8 | 8.10 GB → **3.61 GB** | 8.10 GB → **3.61 GB** |
-| tokens/s, native BF16 → NWC fp8 | 45 → **73.6** | 16.8 → **20.1** (21.7 with `layout=1`) |
-| weight kernels vs native fp8 matvec | 0.85–1.09× (parity) | 0.70× (0.80× with `layout=1`) |
-| size vs fp8 | **0.87** | **0.87** |
-| perplexity WikiText-2, BF16 → fp8 | 18.03 → 18.15 (the fp8 quantization; NWC changes nothing) | |
+| Qwen3-4B | native BF16 | native fp8 (uncompressed) | **NWC fp8** |
+|---|---|---|---|
+| VRAM, RTX 4070 | 8.10 GB | 4.44 GB¹ | **3.61 GB** |
+| tokens/s, RTX 4070 | 45 | 75.0 | **73.6** |
+| tokens/s, NVIDIA A16 | 16.8 | 25.8 | **20.1** (21.7 with `layout=1`) |
+| weight kernels vs native fp8 matvec | | 1× | 4070: 0.85–1.09× · A16: 0.70× (0.80× with `layout=1`) |
+| bytes per weight | 2 | 1 | **0.87** |
+| perplexity WikiText-2 | 18.03 | 18.15 | 18.15 (the fp8 quantization; NWC changes nothing) |
+
+¹ `python -m nwc.demo MODEL --native-fp8`: the same quantization served uncompressed by the library's reference
+fp8 matvec; its tied `lm_head` stays BF16, hence the extra VRAM. An external baseline (vLLM fp8) is
+[#10](https://github.com/parda21/NWC/issues/10).
 
 int8 was measured and not built: its symbol alphabet is flat, the prefix code would save 5 %, an ideal coder 13 %
 (section 7 there).
