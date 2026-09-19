@@ -498,7 +498,13 @@ kern_gather(const uint8_t *__restrict__ data, const uint32_t *__restrict__ bases
 /* ============================ Layout 1: tensor-core accumulation ============================ */
 /* bf16x2 <- two fp32 (a in the upper half, b in the lower) */
 __device__ __forceinline__ uint32_t pack_bf16x2(float hi, float lo) {
+#if __CUDA_ARCH__ >= 800
     uint32_t r; asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo)); return r;
+#else
+    uint32_t h = __float_as_uint(hi), l = __float_as_uint(lo);                 /* sm_75: round to nearest even by hand */
+    h += 0x7FFFu + ((h >> 16) & 1u); l += 0x7FFFu + ((l >> 16) & 1u);
+    return (h & 0xFFFF0000u) | (l >> 16);
+#endif
 }
 /* raw words of a lane's super-chunk: 4 words, word w holds the raw bytes of weights 4w..4w+3 (mma h = w>>1) */
 template<int ELEM>

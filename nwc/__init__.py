@@ -7,7 +7,7 @@
     model = load_pretrained("Qwen3-4B-NWC")  # load without the BF16 originals (or a HF repo id)
     export_bf16("Qwen3-4B-NWC", "Qwen3-4B")  # back to a plain BF16 checkpoint, bit-identical
 """
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 from .nwc_torch import NWCWeight, NWCLinear, NWCEmbedding, convert, fuse, fits, choose_block, quantize_fp8   # noqa: E402
 from .checkpoint import save_pretrained, load_pretrained, export_bf16                                      # noqa: E402
