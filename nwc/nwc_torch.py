@@ -260,6 +260,40 @@ class NWCWeight:
         return self.dequant().to(torch.float8_e4m3fn), self.scale
 
 
+class RefFP8Linear(nn.Module):
+    """Comparison only: weight-only fp8 without compression, served by the library's reference fp8 matvec at batch 1
+    (one byte per weight at the memory bandwidth) and by dequantization + cuBLAS otherwise. Same quantization as
+    NWCWeight(elem="fp8"), so tokens/s of this module are the "native fp8" baseline for NWC-fp8 at model level."""
+    def __init__(self, linear: nn.Linear, device="cuda"):
+        super().__init__()
+        q, scale = quantize_fp8(linear.weight.data)
+        self.w8 = q.contiguous().to(device); self.scale = scale.to(device)
+        self.in_features, self.out_features = linear.in_features, linear.out_features
+        self.bias = None if linear.bias is None else nn.Parameter(linear.bias.data.to(device=device, dtype=torch.bfloat16), requires_grad=False)
+
+    def forward(self, x):
+        if x.numel() == self.in_features and x.dtype == torch.bfloat16:
+            y = ref_fp8_matvec(self.w8, self.scale, x.reshape(-1).float())
+            if self.bias is not None: y = y + self.bias
+            return y.view(*x.shape[:-1], self.out_features)
+        y = F.linear(x, self.w8.to(torch.bfloat16)).float() * self.scale
+        if self.bias is not None: y = y + self.bias.float()
+        return y.to(x.dtype)
+
+
+def convert_ref_fp8(model: nn.Module, device="cuda", verbose=True):
+    """Replace every nn.Linear by RefFP8Linear (the uncompressed fp8 baseline); the tied lm_head stays BF16."""
+    shared = {m.weight.data_ptr() for m in model.modules() if isinstance(m, nn.Embedding)}
+    n = 0
+    for name, mod in list(model.named_modules()):
+        for child, cm in list(mod.named_children()):
+            if isinstance(cm, nn.Linear) and cm.weight.dtype == torch.bfloat16 and cm.weight.data_ptr() not in shared:
+                setattr(mod, child, RefFP8Linear(cm, device)); cm.weight.data = torch.empty(0); n += 1
+    model.to(device)
+    if verbose: print(f"reference fp8: {n} linear layers replaced (uncompressed fp8, reference matvec)")
+    return n
+
+
 class NWCLinear(nn.Module):
     """Drop-in replacement for nn.Linear on a compressed matrix (elem "bf16" lossless, or "fp8" weight-only)."""
     def __init__(self, linear: nn.Linear = None, device="cuda", block=None, w: "NWCWeight" = None, bias=None, elem="bf16"):

@@ -17,6 +17,7 @@ def main():
     ap.add_argument("--save", default=None, help="write an NWC checkpoint to this directory")
     ap.add_argument("--native", action="store_true", help="do not compress (comparison)")
     ap.add_argument("--fp8", action="store_true", help="quantize to weight-only fp8 e4m3 first, then compress the fp8 values")
+    ap.add_argument("--native-fp8", action="store_true", help="comparison: the same fp8 quantization without compression, reference fp8 matvec")
     ap.add_argument("--no-fusion", action="store_true", help="do not fuse q/k/v and gate/up")
     ap.add_argument("--tokens", type=int, default=64)
     ap.add_argument("--graph", action="store_true", help="time the decode step as a CUDA graph")
@@ -41,6 +42,9 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16, device_map="cpu", low_cpu_mem_usage=True)
         if a.native:
             model.cuda()
+        elif a.native_fp8:
+            from .nwc_torch import convert_ref_fp8
+            convert_ref_fp8(model)
         else:
             from .nwc_torch import convert, fuse
             elem = "fp8" if a.fp8 else "bf16"
@@ -48,7 +52,7 @@ def main():
             convert(model, elem=elem)
         model.eval()
     print(f"loaded in {time.time()-t0:.0f} s, VRAM in use {torch.cuda.memory_allocated()/1e9:.2f} GB")
-    if a.save and not a.native:
+    if a.save and not (a.native or a.native_fp8):
         from .checkpoint import save_pretrained
         c = save_pretrained(model, a.save, tokenizer=tok, base_model=None if a.load else a.model)
         print(f"checkpoint written: {a.save} ({c['bytes_nwc']/1e9:.2f} GB of compressed matrices)")
