@@ -14,6 +14,7 @@ ap.add_argument("--window", type=int, default=1024, help="window length for the 
 ap.add_argument("--cpu-compare", action="store_true", help="compare logits against native BF16 on the CPU (slow)")
 ap.add_argument("--native", action="store_true", help="without NWC: uncompressed model on the GPU (baseline)")
 ap.add_argument("--fusion", action="store_true", help="fuse q/k/v and gate/up")
+ap.add_argument("--elem", default="bf16", choices=["bf16", "fp8"], help="fp8: weight-only fp8 e4m3 (per-channel scale) before compression")
 ap.add_argument("--logits-file", default=None, help="save/compare the logits of the first prompt (.pt)")
 a = ap.parse_args()
 
@@ -36,8 +37,8 @@ if a.native:
     model.cuda(); torch.cuda.synchronize()
     print(f"native on the GPU in {time.time()-t0:.0f} s; VRAM in use: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 else:
-    if a.fusion: fuse(model)
-    nwc_b, bf16_b = convert(model)
+    if a.fusion: fuse(model, elem=a.elem)
+    nwc_b, bf16_b = convert(model, elem=a.elem)
     torch.cuda.synchronize()
     print(f"converted in {time.time()-t0:.0f} s; VRAM in use: {torch.cuda.memory_allocated()/1e9:.2f} GB "
           f"(uncompressed the model would take {sum(p.numel() for p in model.parameters())*2/1e9 + bf16_b/1e9:.2f} GB)")

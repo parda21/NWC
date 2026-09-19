@@ -25,6 +25,9 @@ fits a 12 GB card.
 
 ## News
 
+- **main** · fp8: weight-only fp8 e4m3 models (per-channel scale) with the fp8 values stored lossless, 0.87 of the
+  fp8 size, same speed as a native fp8 matvec on the RTX 4070 and 1.2–2.1× cuBLAS BF16 (`--fp8` in the demo,
+  `convert(model, elem="fp8")`; [docs/results.md](docs/results.md), section 8).
 - **2026-09-19** · v0.9.1: `python -m nwc.doctor` environment check, `export_bf16` back to plain checkpoints,
   Hugging Face repo ids in `load_pretrained` and the demo, kernels built for Turing (sm_75), CI, and a
   [0.6B smoke-test checkpoint](https://huggingface.co/Parda21/Qwen3-0.6B-NWC).
@@ -58,6 +61,8 @@ export_bf16("my-model-NWC", "my-model")                 # back to a plain BF16 c
 
 The converted model is a normal Transformers model: `generate`, chat templates, `StaticCache` and CUDA graphs all
 work. Batch 1 runs through the fused kernel; prefill dequantizes into a temporary buffer and calls cuBLAS.
+`convert(model, elem="fp8")` (demo: `--fp8`) quantizes to weight-only fp8 e4m3 first and stores the fp8 values
+lossless: 0.43 of the BF16 size, and on the RTX 4070 as fast as a native fp8 matvec.
 
 ## Results
 
@@ -135,8 +140,10 @@ Tracked in [milestones](https://github.com/parda21/NWC/milestones) and
 [roadmap issues](https://github.com/parda21/NWC/issues?q=is%3Aissue+label%3Aroadmap).
 
 - [x] v0.9 · format v9, A16 parity, shape-independent, PyPI wheels (Windows, Linux), HF checkpoints, CI
+- [x] v0.10 · fp8 weight-only element type (fp8 values lossless, 0.87 of fp8 size, native-fp8 speed on Ada)
 - [ ] v0.10 · measure RTX 4080 Super ([#1](https://github.com/parda21/NWC/issues/1)) and H100 ([#2](https://github.com/parda21/NWC/issues/2)); community results into the hardware table ([#8](https://github.com/parda21/NWC/issues/8))
-- [ ] v0.10 · tensor-core accumulation path (`mma.m16n8k16`) for A100 / H100 SXM parity ([#3](https://github.com/parda21/NWC/issues/3))
+- [ ] v0.10 · tensor-core accumulation path (`mma.m16n8k16`) for A100 / H100 SXM parity ([#3](https://github.com/parda21/NWC/issues/3)); also the lever for fp8 speed beyond parity
+- [ ] v0.10 · why does Ada need 17 SM clocks per warp step where Ampere needs 11? (same SASS; docs/results.md section 8)
 - [ ] v0.10 · second model family (Llama 3.1 8B, Mistral) with perplexity check ([#4](https://github.com/parda21/NWC/issues/4)); Colab notebook on a T4 ([#5](https://github.com/parda21/NWC/issues/5))
 - [ ] v1.0 · llama.cpp port (GGML tensor type, CUDA mmv kernel, converter), the road to Ollama / LM Studio ([#6](https://github.com/parda21/NWC/issues/6))
 - [ ] v1.0 · paper, draft in `docs/paper/` ([#7](https://github.com/parda21/NWC/issues/7))
@@ -156,6 +163,11 @@ same way cuBLAS differs between two GPUs.
 
 **Does it make prefill or batched inference faster?** No. Batch 1 (token generation) is the fast path; prefill
 dequantizes into a temporary BF16 buffer and calls cuBLAS, so it only saves memory.
+
+**What about int8 / fp8 models?** fp8 e4m3 weight-only is supported (`elem="fp8"`): the fp8 values are stored
+lossless at 0.87 of their size, decoded by the same kernel, at native-fp8 speed on the 4070 (0.7× on the A16,
+where the decoder is the limit). int8 was measured and not built: its symbol alphabet is flat, the prefix code
+would save only 5 %, an ideal coder 13 %. Numbers in [docs/results.md](docs/results.md), sections 7 and 8.
 
 **Which models work?** Any HF causal LM in BF16; the encoder only needs the weights. Tested: Qwen2.5 (3B, 7B),
 Qwen3 (0.6B, 4B). Small models (0.6B) save memory but are not faster: their matrices are launch-bound.

@@ -182,3 +182,37 @@ the decoder's time budget per weight shrinks by the same factor as the stored si
 int4), because the uncompressed competitor is already that much faster than BF16. Consequence: on top of
 quantized formats NWC is a memory saving of 13–19 %, not a speed-up, until the decoder is several times faster
 than v9 (tensor-core path, [#3](https://github.com/parda21/NWC/issues/3)).
+
+## 8. FP8 element type (weight-only fp8 e4m3, the fp8 values stored lossless)
+
+Format v9 with `elem = 1` (docs/format.md, section 4b): Qwen3-4B quantized to weight-only fp8 with a per-channel
+scale (`quantize_fp8`), the fp8 bytes entropy-coded to 0.866 of their size and decoded by the same kernel.
+Baseline is the library's own reference fp8 matvec (`nwc_ref_fp8`: hardware e4m3x2 conversion and HFMA2 on
+sm_89+, a shared-memory table on older parts), which reads exactly one byte per weight; cuBLAS BF16 is shown for
+context (`scripts/kernbench.py --elem fp8`).
+
+| layer (M × K) | 4070: fp8 ref / NWC-fp8 | ratio | cuBLAS BF16 | A16: fp8 ref / NWC-fp8 | ratio | cuBLAS BF16 |
+|---|---|---|---|---|---|---|
+| qkv 6144 × 2560 | 0.071 / 0.074 ms | 0.96× | 0.108 ms | 0.128 / 0.179 ms | 0.72× | 0.200 ms |
+| o 2560 × 4096 | 0.059 / 0.070 ms | 0.85× | 0.085 ms | 0.090 / 0.129 ms | 0.70× | 0.135 ms |
+| gate_up 19456 × 2560 | 0.151 / 0.138 ms | 1.09× | 0.253 ms | 0.388 / 0.538 ms | 0.72× | 0.605 ms |
+| down 2560 × 9728 | 0.098 / 0.100 ms | 0.98× | 0.147 ms | 0.193 / 0.275 ms | 0.70× | 0.306 ms |
+| lm_head 151936 × 2560 | 0.849 / 0.842 ms | 1.01× | 1.765 ms | 3.053 / 4.222 ms | 0.72× | 4.797 ms |
+| sum per token | 14.5 / 14.6 ms | 0.99× | ~26 ms | 31.8 / 44.6 ms | 0.71× | 49.6 ms |
+
+Reading: NWC-fp8 costs the decoder the same per weight as NWC-BF16 (the hot loop is identical), so its time
+equals the BF16 kernel's (4070 gate_up 0.138 vs 0.163 ms, A16 0.538 vs 0.522 ms) while the native fp8 competitor
+is twice as fast as cuBLAS BF16. Where the BF16 kernel had headroom (4070) fp8 lands at parity with native fp8
+and 1.2–2.1× cuBLAS BF16 at 0.43 of the BF16 size; where it was at parity (A16) fp8 is 0.7× native fp8 and
+still 1.1× cuBLAS BF16. The fp8 reference reaches 459 GB/s on the 4070 (lm_head) and 128 GB/s on the A16.
+
+**The Ada finding.** The 4070 executes the same SASS at about 17 SM clocks per warp step (2.7 GHz verified
+under load with `nvidia-smi -lms 250`), the A16 at 11. Knockouts on the 4070 (gate_up fp8, 0.146 ms): no raw-plane
+loads 0.112 ms, no stream refill 0.144, neither 0.140; L2-resident data is as fast as DRAM; prefetching this
+block's rows into L1 or the next block into L2 (compile switches `PF_ROWS_L1`, `PF_NEXT_L2`) is neutral to
+−10 %. So the kernel is issue- or latency-bound in the SM, not in memory, and Ada needs 1.5× the clocks of
+Ampere for it; the cause is open (Nsight Compute is not installed here). Closing that gap would make fp8 on
+the 4070 bandwidth-bound (1.14× native fp8) and BF16 on the 4080 Super / 4090 more comfortable.
+
+Quantized entropies (section 7) put the ceiling for fp8 at 0.828 with an ideal coder on the 4-bit exponent;
+the decoder-friendly split costs 0.866 (+4.6 %).
