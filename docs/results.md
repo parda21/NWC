@@ -251,8 +251,10 @@ Reading: on the A16 (issue-bound) the tensor-core layout makes fp8 9–13 % fast
 fp8 matvec) and leaves BF16 at parity; on the 4070 it is at parity for large layers and behind on small ones
 (half as many blocks per matrix, so the tail of the persistent grid weighs more). At model level on the 4070 the
 fp8 Qwen3-4B runs at 66.9 tokens/s with layout 1 against 73.6 with layout 0 (checkpoint 3.49 instead of 3.54 GB).
-Layout 1 therefore stays opt-in (`NWCWeight(layout=1)`, `NWC_LAYOUT=1`) until more GPUs are measured; the A16
-model-level numbers are below.
+On the A16 the same model runs at 21.7 tokens/s with layout 1 against 20.1 with layout 0 (BF16 native 16.8, NWC
+BF16 18.2). Layout 1 therefore stays opt-in (`NWCWeight(layout=1)`, `NWC_LAYOUT=1`) until more GPUs are measured:
+it wins where the decoder is issue-bound and the SM count is small, and loses where the persistent grid's tail
+dominates.
 
 What it took to get there, all measured on the 4070 with fp8 lm_head (layout 0: 0.819 ms): the first version with
 16-column chunks, a bounds-checked raw load and fp32 x converted per chunk ran at 0.992 ms; the unconditional
