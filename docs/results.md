@@ -146,11 +146,18 @@ Kept as compile switches in the respective sources so they can be re-measured.
 
 ## 6. Open items
 
+Tracked as [roadmap issues](https://github.com/parda21/NWC/issues?q=is%3Aissue+label%3Aroadmap) on GitHub.
+
 1. Tensor-core accumulation path (see `docs/format.md`) for A100 / H100 SXM parity; measure `pipe_bench` on
-   Hopper first.
-2. Measure on RTX 4080 Super and H100.
+   Hopper first ([#3](https://github.com/parda21/NWC/issues/3)).
+2. Measure on RTX 4080 Super ([#1](https://github.com/parda21/NWC/issues/1)) and H100
+   ([#2](https://github.com/parda21/NWC/issues/2)); community results ([#8](https://github.com/parda21/NWC/issues/8)).
 3. Small matrices (qkv, o) reach 1.06–1.18× instead of 1.5×: launch and tail effects; Nsight Compute needs
-   the performance-counter permission.
-4. Second model family (Llama 3.1 8B / Mistral) and perplexity with a common window count.
-5. llama.cpp port: new GGML tensor type, CPU dequantization, CUDA mmv kernel, converter.
+   the performance-counter permission. Qwen3-0.6B (matrices ≤ 1024 × 2048) is launch-bound and 0.83× native on
+   the 4070 (162 vs 196 tokens/s as a CUDA graph) while saving 30 % of VRAM.
+4. Second model family (Llama 3.1 8B / Mistral) and perplexity with a common window count
+   ([#4](https://github.com/parda21/NWC/issues/4)).
+5. llama.cpp port: new GGML tensor type, CPU dequantization, CUDA mmv kernel, converter
+   ([#6](https://github.com/parda21/NWC/issues/6)).
 6. Prefill (batch > 1) dequantizes into a scratch buffer — no speed gain there.
+7. Turing (sm_75) builds without spills (56 registers) but has not been run ([#5](https://github.com/parda21/NWC/issues/5)).

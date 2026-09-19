@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="250" viewBox="0 0 1000 250" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#6e7781"/>
+    </marker>
+  </defs>
+  <style>
+    .box { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.2; rx: 8; }
+    .hot { fill: #ddf4ff; stroke: #54aeff; }
+    .t { fill: #24292f; }
+    .s { fill: #57606a; font-size: 11.5px; }
+    .h { font-weight: 600; font-size: 14px; }
+    .arr { stroke: #6e7781; stroke-width: 1.4; fill: none; marker-end: url(#a); }
+    .code { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  </style>
+
+  <!-- 1: BF16 weight -->
+  <rect class="box" x="16" y="40" width="200" height="150"/>
+  <text class="t h" x="116" y="64" text-anchor="middle">BF16 weight</text>
+  <rect x="36" y="80" width="20" height="26" fill="#ffd8a8" stroke="#d0d7de"/>
+  <rect x="56" y="80" width="80" height="26" fill="#ffd8a8" stroke="#d0d7de"/>
+  <rect x="136" y="80" width="60" height="26" fill="#c6f6d5" stroke="#d0d7de"/>
+  <text class="code t" x="46" y="98" text-anchor="middle">s</text>
+  <text class="code t" x="96" y="98" text-anchor="middle">exponent 8</text>
+  <text class="code t" x="166" y="98" text-anchor="middle">mant. 7</text>
+  <text class="s" x="116" y="130" text-anchor="middle">high byte: 2.6–2.9 bits of entropy</text>
+  <text class="s" x="116" y="148" text-anchor="middle">low byte: 7.97 bits, stored raw</text>
+  <text class="s" x="116" y="174" text-anchor="middle">16 bits per weight</text>
+
+  <path class="arr" d="M216,115 L262,115"/>
+
+  <!-- 2: prefix code -->
+  <rect class="box" x="262" y="40" width="230" height="150"/>
+  <text class="t h" x="377" y="64" text-anchor="middle">Prefix code (format v9)</text>
+  <text class="s" x="377" y="88" text-anchor="middle">exponents ranked by frequency</text>
+  <text class="code t" x="377" y="112" text-anchor="middle">rank r → r zeros, 1, sign</text>
+  <text class="code t" x="377" y="130" text-anchor="middle">rank ≥ 15 → 16 bits + raw byte</text>
+  <text class="s" x="377" y="154" text-anchor="middle">one bit stream per lane, blocks of 8 × 512</text>
+  <text class="s" x="377" y="174" text-anchor="middle">≈ 11 bits per weight, 0.69 of BF16</text>
+
+  <path class="arr" d="M492,115 L538,115"/>
+
+  <!-- 3: fused kernel -->
+  <rect class="box hot" x="538" y="24" width="300" height="182"/>
+  <text class="t h" x="688" y="48" text-anchor="middle">Fused matvec, decoded in registers</text>
+  <text class="s" x="688" y="72" text-anchor="middle">one warp per block, one persistent CTA per SM</text>
+  <text class="code t" x="556" y="98">12-bit peek → 16 KB LUT in smem → 2 codes</text>
+  <text class="code t" x="556" y="118">funnel-shift window, 1 IMAD.WIDE refill</text>
+  <text class="code t" x="556" y="138">prmt: exp byte + mant byte → fp32 weight</text>
+  <text class="code t" x="556" y="158">ffma with x held in 16 registers</text>
+  <text class="s" x="688" y="186" text-anchor="middle">no decompressed weight ever touches memory</text>
+
+  <path class="arr" d="M838,115 L884,115"/>
+
+  <!-- 4: output -->
+  <rect class="box" x="884" y="40" width="100" height="150"/>
+  <text class="t h" x="934" y="64" text-anchor="middle">y = W x + b</text>
+  <text class="s" x="934" y="96" text-anchor="middle">BF16 out</text>
+  <text class="s" x="934" y="116" text-anchor="middle">weights</text>
+  <text class="s" x="934" y="132" text-anchor="middle">bit-exact</text>
+  <text class="s" x="934" y="160" text-anchor="middle">reads 69 %</text>
+  <text class="s" x="934" y="176" text-anchor="middle">of the bytes</text>
+
+  <text class="s" x="500" y="236" text-anchor="middle">Token generation is memory-bound: fewer bytes read per token = faster, as long as the decoder keeps up with the memory system.</text>
+</svg>

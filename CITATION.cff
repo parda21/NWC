@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use NWC in your work, please cite it as below."
+title: "NWC: Neural Weight Compression"
+abstract: "Lossless BF16 weight compression for transformer inference with a fused CUDA matvec that decodes the weights in registers, faster than cuBLAS on the uncompressed weights."
+authors:
+  - family-names: Otto
+    given-names: Paul
+type: software
+version: 0.9.1
+date-released: 2026-09-19
+license: Apache-2.0
+repository-code: "https://github.com/parda21/NWC"
+url: "https://github.com/parda21/NWC"
+keywords:
+  - lossless compression
+  - bf16
+  - cuda
+  - llm inference
+  - memory-bound

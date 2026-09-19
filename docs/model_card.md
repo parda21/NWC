@@ -41,10 +41,14 @@ ids = tok("Question: What is a binary tree? Answer:", return_tensors="pt").input
 print(tok.decode(model.generate(ids, max_new_tokens=64, do_sample=False)[0]))
 ```
 
-Or from the command line: `python -m nwc.demo Parda21/Qwen3-4B-NWC --load --graph`
+Or from the command line: `python -m nwc.demo Parda21/Qwen3-4B-NWC --load --graph`. A 0.8 GB smoke test of the same
+setup: [Parda21/Qwen3-0.6B-NWC](https://huggingface.co/Parda21/Qwen3-0.6B-NWC).
 
-Requirements: NVIDIA GPU with compute capability 8.0 or newer (Ampere, Ada, Hopper; Blackwell via PTX
-JIT), CUDA driver for CUDA 12.6+, PyTorch with CUDA. Batch-1 generation runs through the fused kernel;
+Back to a plain BF16 checkpoint (bit-identical, for tools that do not know NWC):
+`python -m nwc.export Parda21/Qwen3-4B-NWC Qwen3-4B`
+
+Requirements: NVIDIA GPU with compute capability 7.5 or newer (8.0+ measured; Blackwell via PTX JIT), CUDA driver
+for CUDA 12.6+, PyTorch with CUDA. `python -m nwc.doctor` checks the setup. Batch-1 generation runs through the fused kernel;
 prefill (batch > 1) dequantizes into a temporary BF16 buffer and uses cuBLAS.
 
 ## How it was made

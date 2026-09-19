@@ -1,141 +1,210 @@
-# NWC — Neural Weight Compression
+<div align="center">
 
-Lossless BF16 weight compression with a fused GPU matvec. NWC keeps the weights of a transformer in VRAM **losslessly compressed by ~31 %** and decodes them
-**inside the matrix-vector kernel, in registers**. No decompressed weight ever touches memory. Because token
-generation is memory-bound, reading fewer bytes makes the kernel faster than the uncompressed cuBLAS
-matvec — on consumer GPUs by a wide margin, and since format v9 also on a bandwidth-starved Ampere part.
+# NWC · Neural Weight Compression
 
-Qwen3-4B, greedy decoding as a CUDA graph, same tokens as the reference (64/64):
+**Lossless BF16 weights, 31 % smaller, decoded inside the CUDA matvec.**
+Faster than cuBLAS on the uncompressed weights. Bit-identical weights, no quantization.
+
+[![PyPI](https://img.shields.io/pypi/v/neural-weight-compression?label=pypi&color=1f6feb)](https://pypi.org/project/neural-weight-compression/)
+[![downloads](https://img.shields.io/pypi/dm/neural-weight-compression?color=1f6feb)](https://pypi.org/project/neural-weight-compression/)
+[![ci](https://github.com/parda21/NWC/actions/workflows/ci.yml/badge.svg)](https://github.com/parda21/NWC/actions/workflows/ci.yml)
+[![model](https://img.shields.io/badge/%F0%9F%A4%97%20checkpoint-Qwen3--4B--NWC-ffcc4d)](https://huggingface.co/Parda21/Qwen3-4B-NWC)
+[![license](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
+
+[Quickstart](#quickstart) · [Results](#results) · [How it works](#how-it-works) · [Hardware](#hardware) · [Roadmap](#roadmap) · [FAQ](#faq) · [For agents](#for-agents)
+
+</div>
+
+![Qwen3-4B: tokens/s, VRAM, and GPU time per token vs DFloat11](docs/img/headline.png)
+
+Token generation is memory-bound: every weight is read once per token. NWC stores the weights entropy-coded
+in VRAM and decodes them in registers, inside the matrix-vector kernel, so the GPU reads 69 % of the bytes and
+no decompressed weight ever touches memory. On an RTX 4070 that makes Qwen3-4B **22 % faster** than native BF16
+while using **2.4 GB less VRAM**; on a bandwidth-starved NVIDIA A16 it is still faster. Qwen2.5-7B in full BF16
+fits a 12 GB card.
+
+## News
+
+- **2026-09-19** · v0.9.1: `python -m nwc.doctor` environment check, `export_bf16` back to plain checkpoints,
+  Hugging Face repo ids in `load_pretrained` and the demo, kernels built for Turing (sm_75), CI, and a
+  [0.6B smoke-test checkpoint](https://huggingface.co/Parda21/Qwen3-0.6B-NWC).
+- **2026-09-16** · v0.9.0: format v9 (prefix code + lookup table) reaches parity on the A16, any matrix shape,
+  [PyPI package](https://pypi.org/project/neural-weight-compression/) and the
+  [Qwen3-4B checkpoint](https://huggingface.co/Parda21/Qwen3-4B-NWC).
+
+## Quickstart
+
+Needs an NVIDIA GPU (Turing or newer, Ampere or newer measured), a driver for CUDA 12.6+ and PyTorch with CUDA.
+
+```bash
+pip install neural-weight-compression transformers accelerate
+python -m nwc.doctor                                          # GPU, driver, library, kernel round trip: all ok?
+python -m nwc.demo Parda21/Qwen3-0.6B-NWC --load --graph      # 1 minute, 0.8 GB download: does everything run?
+python -m nwc.demo Parda21/Qwen3-4B-NWC --load --graph        # 5.6 GB: the model the numbers above are from
+python -m nwc.demo Qwen/Qwen3-4B --native --graph             # the same model uncompressed, for comparison
+```
+
+The demo prints VRAM in use, the generated text and tokens/s, once through HF `generate` and once as a CUDA
+graph (no Python overhead). `--save DIR` writes a compressed checkpoint of any BF16 model you pass it.
+
+```python
+from nwc import fuse, convert, save_pretrained, load_pretrained, export_bf16
+
+fuse(model); convert(model)                             # any HF causal LM in BF16: nn.Linear -> NWCLinear, on the GPU
+save_pretrained(model, "my-model-NWC", tokenizer=tok)   # compressed checkpoint (safetensors + nwc_config.json)
+model = load_pretrained("my-model-NWC")                 # or a HF repo id; no BF16 originals needed
+export_bf16("my-model-NWC", "my-model")                 # back to a plain BF16 checkpoint, bit-identical
+```
+
+The converted model is a normal Transformers model: `generate`, chat templates, `StaticCache` and CUDA graphs all
+work. Batch 1 runs through the fused kernel; prefill dequantizes into a temporary buffer and calls cuBLAS.
+
+## Results
+
+Qwen3-4B, greedy decoding as a CUDA graph, same tokens as the reference (64/64). Full tables, the cost model and
+the negative results are in [docs/results.md](docs/results.md).
 
 | | RTX 4070 (452 GB/s) | NVIDIA A16 (vGPU 16Q, 10 SMs, 165 GB/s) |
 |---|---|---|
 | VRAM, native BF16 → NWC | 8.10 GB → **5.67 GB** | 8.10 GB → **5.67 GB** |
 | tokens/s, native → NWC | 45 → **55** (1.22×) | 16.8 → **18.2** (1.08×) |
 | GPU time per token, native → NWC | 20.4 ms → **18.9 ms** | 54.1 ms → **52.1 ms** |
-| weight kernels vs cuBLAS (5 layer shapes) | 1.17–1.55× | 1.06–1.18× |
-| logits vs native | bit-identical | within cuBLAS' own cross-GPU spread (max 0.20; argmax identical) |
+| weight kernels vs cuBLAS, 5 layer shapes | 1.17–1.55× | 1.06–1.18× |
+| logits vs native | bit-identical | within cuBLAS' own cross-GPU spread (max 0.20, argmax identical) |
 
-Same model, same GPU, against [DFloat11](https://github.com/LeanModels/DFloat11) (NeurIPS 2025), which
-compresses the same exponent bits with Huffman coding but decodes into a buffer before the matmul
-(RTX 4070, GPU time per token measured with `torch.profiler`, HF eager; `scripts/compare_df11.py`):
+Against [DFloat11](https://github.com/LeanModels/DFloat11) (NeurIPS 2025), which compresses the same exponent
+bits with Huffman coding but decodes into a buffer before the matmul. Same model, same GPU, GPU time per token
+by `torch.profiler` ([scripts/compare_df11.py](scripts/compare_df11.py)):
 
-| | native BF16 | DFloat11 | NWC |
+| RTX 4070 | native BF16 | DFloat11 | NWC |
 |---|---|---|---|
 | VRAM | 8.10 GB | 5.73 GB | **5.67 GB** |
 | GPU time per token | 20.4 ms | 56.1 ms (2.74× native) | **18.9 ms** (0.93× native) |
 | weight kernels per token | gemv 17.2 ms | decode 36.6 + gemv 16.2 ms | **17.3 ms**, decode fused |
-| logits vs native | — | bit-identical (paper) | bit-identical (measured) |
 
-Same size, opposite speed: DFloat11's decoded weights pass through memory twice, NWC reads only the
-compressed bytes. DFloat11 has not been measured under a CUDA graph (its decode runs in separate cupy
-kernels), so GPU time is the comparable figure.
-
-Decompressed weights are bit-exact on both GPUs (`tests/test_k.py`, `tests/test_gather.py`). Qwen2.5-7B in
-full BF16 fits a 12 GB card (14.1 → 9.7 GB of weights). Measurements, negative results and the cost model:
-[docs/results.md](docs/results.md). Format and decoder design: [docs/format.md](docs/format.md).
+Same size, opposite speed: DFloat11's decoded weights pass through memory twice, NWC reads only the compressed
+bytes. Both land at the entropy of the mantissa; the choice of coder moves the size by 1–2 %.
 
 ## How it works
+
+![BF16 weight → prefix code → fused matvec → output](docs/img/pipeline.svg)
 
 - **Byte planes.** A BF16 weight is split into its mantissa byte (7.97 bits of entropy, stored raw) and its
   exponent/sign byte (2.6–2.9 bits of entropy, entropy-coded). That is where the 31 % come from; ZipNN and
   DFloat11 land at the same figure because it is the entropy of the data.
-- **Prefix code instead of rANS (format v9).** The exponent is ranked by frequency and written as a unary
-  rank code plus a raw sign bit (escape for rare values). A 12-bit peek into a 16 KB lookup table in shared
-  memory yields two complete codes per step; the bit window is shifted with funnel shifts and refilled with a
-  single wide multiply-add. Measured on the A16: 11–13 SM clocks per 64 weights, below the 13.6 needed to
-  match cuBLAS.
-- **Fused kernel.** One persistent block per SM (1024 threads); each lane decodes its own bit stream for a
-  block of 8 rows × 512 columns, keeps the 16 matching activations in registers and accumulates eight row
-  sums; a transposed shuffle reduction writes partial sums per (row, column block). Works for any matrix
-  shape (padding costs 2 bits per filler weight, no mantissa).
-- **Dequantization and embedding lookup** (tied `lm_head`) run on the same decoder; prefill (batch > 1)
-  dequantizes into a temporary BF16 buffer and calls cuBLAS.
+- **Prefix code instead of rANS (format v9).** Exponents are ranked by frequency and written as a unary rank code
+  plus a raw sign bit, with an escape for rare values. A 12-bit peek into a 16 KB lookup table in shared memory
+  yields two complete codes per step; the bit window is advanced with funnel shifts and refilled with a single
+  wide multiply-add. Measured on the A16: 11–13 SM clocks per 64 weights, below the 13.6 needed to match cuBLAS.
+- **Fused kernel.** One persistent block per SM; each lane decodes its own bit stream for a block of 8 rows × 512
+  columns, keeps its 16 activations in registers and accumulates eight row sums; a transposed shuffle reduction
+  writes partial sums per (row, column block). Any matrix shape works (padding costs 2 bits per filler weight).
+- **Dequantization and embedding lookup** (tied `lm_head`) run on the same decoder.
 
-## Install
+The format is specified in [docs/format.md](docs/format.md) and reproduced by a pure-Python reference decoder in
+[tests/test_format_cpu.py](tests/test_format_cpu.py).
 
-```bash
-pip install neural-weight-compression            # wheels for Windows and Linux with prebuilt kernels (sm_80–sm_90, PTX for newer)
-pip install transformers accelerate              # for the model helpers and the demo
-python -m nwc.demo Qwen/Qwen3-4B --graph         # load, compress, generate, report VRAM and tokens/s
-```
+## Hardware
 
-```python
-from nwc import fuse, convert, save_pretrained, load_pretrained
-fuse(model); convert(model)                      # nn.Linear -> NWCLinear, model to the GPU
-save_pretrained(model, "Qwen3-4B-NWC", tokenizer=tok, base_model="Qwen/Qwen3-4B")
-model = load_pretrained("Qwen3-4B-NWC")          # later: straight to the GPU, no BF16 originals needed
-```
+Whether NWC beats native depends on decoder throughput versus memory bandwidth × 0.69 (see
+[docs/results.md](docs/results.md), section 3). Measured rows are ours; projected rows assume Ampere issue rates.
 
-A ready-made compressed checkpoint is on Hugging Face: [Parda21/Qwen3-4B-NWC](https://huggingface.co/Parda21/Qwen3-4B-NWC)
-(`python -m nwc.demo Parda21/Qwen3-4B-NWC --load --graph` after `hf download Parda21/Qwen3-4B-NWC --local-dir Qwen3-4B-NWC`).
+| GPU | status | weight kernels vs cuBLAS | Qwen3-4B tokens/s, native → NWC |
+|---|---|---|---|
+| RTX 4070 | ✅ measured | 1.17–1.55× | 45 → 55 |
+| NVIDIA A16 (vGPU 16Q) | ✅ measured | 1.06–1.18× | 16.8 → 18.2 |
+| RTX 4080 Super | ⏳ next (in house) | ~1.4× projected | |
+| H100 PCIe | 🔍 wanted | ~1.1–1.2× projected | |
+| H100 SXM | 🔍 wanted | ~0.8–0.9× projected, tensor-core path planned | |
+| A100 | 🔍 wanted | ~0.9× projected | |
+| RTX 4090 / 3090 / 30xx | 🔍 wanted | bandwidth-bound, > 1× expected | |
+| T4 / RTX 20xx (Turing) | 🔧 builds (sm_75), unmeasured | | |
+| Blackwell (sm_100/120) | 🔧 PTX JIT on Linux, sm_120 built on Windows, unmeasured | | |
 
-Requirements: an NVIDIA GPU with compute capability 8.0 or newer, a driver for CUDA 12.6+, PyTorch with CUDA.
-Installing from source (`pip install git+https://github.com/parda21/NWC`) needs `nvcc`; run
-`python -m nwc.build` once to compile the kernel into the package.
-
-## Build and test from the repository
-
-Requirements: CUDA 12.6+ (13.x on Windows), a GPU with sm_80 or newer, Python 3.12 with PyTorch (CUDA build)
-and `transformers`. Windows: Visual Studio 2022 Build Tools.
-
-```powershell
-.\build.ps1                       # Windows: build/nwc_ops.dll (add -Fatbin for the package library)
-```
+**Have one of the wanted GPUs?** Two commands and the output in a
+[benchmark issue](https://github.com/parda21/NWC/issues/new?template=benchmark_result.yml) puts your card in this
+table:
 
 ```bash
-./build.sh sm_86                  # Linux: build/nwc_ops.so (nvcc in PATH, pip wheel, or a CUDA container)
+python -m nwc.demo Parda21/Qwen3-4B-NWC --load --graph && python -m nwc.demo Qwen/Qwen3-4B --native --graph
 ```
 
+## Roadmap
+
+Tracked in [milestones](https://github.com/parda21/NWC/milestones) and
+[roadmap issues](https://github.com/parda21/NWC/issues?q=is%3Aissue+label%3Aroadmap).
+
+- [x] v0.9 · format v9, A16 parity, shape-independent, PyPI wheels (Windows, Linux), HF checkpoints, CI
+- [ ] v0.10 · measure RTX 4080 Super ([#1](https://github.com/parda21/NWC/issues/1)) and H100 ([#2](https://github.com/parda21/NWC/issues/2)); community results into the hardware table ([#8](https://github.com/parda21/NWC/issues/8))
+- [ ] v0.10 · tensor-core accumulation path (`mma.m16n8k16`) for A100 / H100 SXM parity ([#3](https://github.com/parda21/NWC/issues/3))
+- [ ] v0.10 · second model family (Llama 3.1 8B, Mistral) with perplexity check ([#4](https://github.com/parda21/NWC/issues/4)); Colab notebook on a T4 ([#5](https://github.com/parda21/NWC/issues/5))
+- [ ] v1.0 · llama.cpp port (GGML tensor type, CUDA mmv kernel, converter), the road to Ollama / LM Studio ([#6](https://github.com/parda21/NWC/issues/6))
+- [ ] v1.0 · paper, draft in `docs/paper/` ([#7](https://github.com/parda21/NWC/issues/7))
+
+## FAQ
+
+**Can I run the checkpoint in LM Studio, Ollama or llama.cpp?** Not yet. An NWC checkpoint is read by
+`nwc.load_pretrained` (PyTorch + Transformers). llama.cpp has no NWC tensor type; that port is on the roadmap
+and is what Ollama and LM Studio would need. vLLM, TGI and SGLang have no loader either.
+
+**Do I need NWC to use the model?** Only while it is compressed. `python -m nwc.export CHECKPOINT OUT` gives you
+the original BF16 checkpoint back, bit for bit, and from there every tool works as usual. There is no lock-in.
+
+**Is it really lossless?** Yes. Dequantized weights equal the originals (`torch.equal`, tested on every commit for
+the format and on the GPU before releases). Only the fp32 summation order of the matvec differs from cuBLAS, the
+same way cuBLAS differs between two GPUs.
+
+**Does it make prefill or batched inference faster?** No. Batch 1 (token generation) is the fast path; prefill
+dequantizes into a temporary BF16 buffer and calls cuBLAS, so it only saves memory.
+
+**Which models work?** Any HF causal LM in BF16; the encoder only needs the weights. Tested: Qwen2.5 (3B, 7B),
+Qwen3 (0.6B, 4B). Small models (0.6B) save memory but are not faster: their matrices are launch-bound.
+
+**My GPU is not in the table.** Run it and tell us. Turing builds but is unmeasured; Blackwell runs via PTX JIT.
+
+**Something fails.** `python -m nwc.doctor` first; paste its output into a
+[bug report](https://github.com/parda21/NWC/issues/new?template=bug_report.yml).
+
+## Install from source
+
 ```bash
-python scripts/download_models.py Qwen/Qwen3-4B [--df11 DFloat11/Qwen3-4B-DF11]
-python scripts/make_wraw.py       # test matrix data/W.raw from a local safetensors model
-python tests/test_k.py            # dequantization bit-exact, token path, fp32 path — odd shapes included
-python tests/test_gather.py       # embedding lookup bit-exact
-python tests/test_checkpoint.py   # save/load of a compressed checkpoint on a small random model, no download
-python tests/test_nwc_torch.py    # PyTorch bridge, speed vs cuBLAS on one matrix
+git clone https://github.com/parda21/NWC && cd NWC
+python -m nwc.build                 # fatbin sm_75..sm_90 + PTX into nwc/lib (needs nvcc 12.6+; 13.x on Windows)
+pip install -e .
 ```
 
-## Run a model
+Repository builds for the local GPU only: `.\build.ps1` (Windows, Visual Studio 2022 Build Tools) or
+`./build.sh sm_86` (Linux) write `build/nwc_ops.dll|so`, which the tests and scripts pick up.
 
 ```bash
+python tests/test_format_cpu.py      # no GPU: reference decoder, bit-exact
+python scripts/make_wraw.py          # test matrix data/W.raw from a local model
+python tests/test_k.py               # GPU: dequantization bit-exact, token path, fp32 path, odd shapes
+python tests/test_gather.py          # GPU: embedding lookup
+python tests/test_checkpoint.py      # GPU: save -> load -> export round trip, no download
 python scripts/kernbench.py --runs 30                              # kernel vs cuBLAS per layer shape
 python scripts/graph_decode.py --mode nwc --fusion --tokens 256    # tokens/s as a CUDA graph, vs HF generate
-python scripts/compare_df11.py --mode native|df11|nwc --fusion     # VRAM, GPU time per token, logits
-python scripts/bench_model.py --model <path> [--native]            # any HF causal LM in BF16, plus perplexity
 ```
-
-## Repository layout
 
 ```
 csrc/nwc_ops.cu   the kernel library: encoder, fused matvec, dequantization, gather
-nwc/              Python package: nwc_torch (NWCLinear, NWCEmbedding, convert, fuse), checkpoint (save/load),
-                  demo, build; lib/ holds the compiled kernel
-tests/            bit-exactness and numerical tests
-scripts/          kernbench, graph_decode, compare_df11, bench_model, make_wraw, download_models, bench_all.sh
-docs/             results.md (measurements, cost model), format.md (format and decoder design), paper/, announce.md
-experiments/      kernel iterations v1–v9, micro-benchmarks (gather_bench.cu, pipe_bench.cu), format experiments,
-                  reference implementations and CLI tools of earlier formats; history, not product
-build/ data/ models/ dist/   build artefacts, test matrices, checkpoints, wheels — git-ignored
+nwc/              Python package: nwc_torch (NWCLinear, convert, fuse), checkpoint (save/load/export), demo, doctor, build
+tests/ scripts/   correctness tests; benchmarks the numbers above come from
+docs/             results.md, format.md, model cards, paper/, announce.md
+experiments/      kernel iterations v1–v9, micro-benchmarks, earlier formats: history, not product
 ```
 
-## Status and limitations
+## For agents
 
-- Batch 1 (token generation) is the fast path. Prefill is not faster than native, it only saves memory.
-- Faster than native requires the decoder to keep up with the memory system: the v9 decoder delivers
-  7–8 GB/s of compressed data per SM·GHz. That is enough for GDDR cards and for the A16, projected enough
-  for an H100 PCIe, and probably not yet for an H100 SXM (see docs/results.md). The planned next step is a
-  tensor-core accumulation path.
-- Tested with Qwen2.5 and Qwen3; any HF causal LM in BF16 should work (the encoder only needs the weights).
+[AGENTS.md](AGENTS.md) is the rule book for coding agents (and humans): repository map, which tests need a GPU and
+which do not, how kernel changes are measured, the conventions, and the pitfalls we already hit. A `CLAUDE.md`
+points there. `tests/test_format_cpu.py` lets an agent without a GPU verify the format bit-exactly.
 
-## Sponsor
+## Contributing, citing, sponsor, license
 
-This project is sponsored by [cloo GmbH](https://github.com/cloogmbh).
+Contributions: see [CONTRIBUTING.md](CONTRIBUTING.md); benchmark results from GPUs we do not have are the most
+useful thing right now. Cite with the [CITATION.cff](CITATION.cff) (GitHub's "Cite this repository" button).
+This project is sponsored by [cloo GmbH](https://github.com/cloogmbh). Apache License 2.0, Copyright 2026 Paul
+Otto, see [LICENSE](LICENSE).
 
-## License
-
-Apache License 2.0, Copyright 2026 Paul Otto. See [LICENSE](LICENSE).
-
-## About this project
-
-Was this project created with the help of AI? Yes.
-Do I care, as long as it works? No.
+**About this project.** Was it created with the help of AI? Yes. Do I care, as long as it works? No.
