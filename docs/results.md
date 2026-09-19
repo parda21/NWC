@@ -225,3 +225,45 @@ Model level, Qwen3-4B on the RTX 4070 (`python -m nwc.demo models/Qwen3-4B --fp8
 
 Quantized entropies (section 7) put the ceiling for fp8 at 0.828 with an ideal coder on the 4-bit exponent;
 the decoder-friendly split costs 0.866 (+4.6 %); with the LUTs, headers and scales the checkpoint lands at 0.88.
+
+## 9. Tensor-core accumulation (layout 1)
+
+Format v10 adds a second block layout, selected per matrix (`NWCWeight(layout=1)`, checkpoints record it; v9
+checkpoints keep loading). Blocks are 16 rows × 512 columns and each lane's stream is in the order of the A
+fragments of `mma.m16n8k16` (bf16 → fp32): lane (r = lane >> 2, q = lane & 3) holds, per 32-column super-chunk,
+columns 8q..8q+7 of rows r and r+8. One PRMT per pair builds a bf16x2 fragment register, x enters as the B
+fragment (one 16-byte load per lane and super-chunk, every lane loading its own columns so that all eight columns
+of D carry the same sums), the D fragment accumulates over the block, and the shuffle reduction, the eight
+accumulators and the sixteen x registers of layout 0 disappear. The raw plane is `[row group][super-chunk][lane]
+[16 bytes]` (fp8: 8 nibble bytes), loaded one super-chunk ahead without a bounds check (512 bytes of slack).
+sm_75 gets an FFMA fallback in the same order. `tests/test_format_cpu.py` reproduces both layouts.
+
+Kernels per layer shape (`scripts/kernbench.py --layout 0|1`), GPU time, medians:
+
+| layer | 4070 BF16: L0 / L1 | 4070 fp8: L0 / L1 | A16 BF16: L0 / L1 | A16 fp8: L0 / L1 |
+|---|---|---|---|---|
+| gate_up 19456 × 2560 | 0.163 / 0.170 ms | 0.137 / 0.140 ms | 0.521 / 0.526 ms | 0.536 / **0.468 ms** |
+| down 2560 × 9728 | 0.106 / 0.127 ms | 0.096 / 0.102 ms | 0.270 / 0.287 ms | 0.276 / **0.253 ms** |
+| lm_head 151936 × 2560 | 1.253 / 1.305 ms | 0.819 / 0.853 ms | 4.538 / 4.511 ms | 4.222 / **3.834 ms** |
+| sum per token | 17.9 / 18.6 ms | 14.1 / 15.7 ms | 44.1 / 45.5 ms | 44.6 / **40.0 ms** |
+
+Reading: on the A16 (issue-bound) the tensor-core layout makes fp8 9–13 % faster (0.72× → 0.80× of the native
+fp8 matvec) and leaves BF16 at parity; on the 4070 it is at parity for large layers and behind on small ones
+(half as many blocks per matrix, so the tail of the persistent grid weighs more). At model level on the 4070 the
+fp8 Qwen3-4B runs at 66.9 tokens/s with layout 1 against 73.6 with layout 0 (checkpoint 3.49 instead of 3.54 GB).
+Layout 1 therefore stays opt-in (`NWCWeight(layout=1)`, `NWC_LAYOUT=1`) until more GPUs are measured; the A16
+model-level numbers are below.
+
+What it took to get there, all measured on the 4070 with fp8 lm_head (layout 0: 0.819 ms): the first version with
+16-column chunks, a bounds-checked raw load and fp32 x converted per chunk ran at 0.992 ms; the unconditional
+raw load with slack 0.892; x as BF16 without conversion 0.888; 32-column super-chunks with one 16-byte x load and
+one 16-byte raw load per two mma 0.853. Knockouts showed the mma and its WARPSYNC cost nothing and the x loads
+5 %: what matters on both architectures is the number of memory instructions per pair, not the ALU count. The
+expected two clocks per step from removing the PRMT/FFMA pairs did not materialise for BF16, which suggests the
+BF16 kernel on the A16 is now limited by its memory access pattern (32 scattered 4-byte stream refills per warp)
+rather than by issue; the next lever there is wider refills.
+
+Edge handling worth knowing: a 16-column chunk is not one mma (the super-chunk column mapping interleaves both),
+so matrices whose `K16` is an odd multiple of 16 code whole super-chunks with fillers, and the dequantization and
+gather kernels guard their stores with `column < K16`; the first version wrote filler columns past the row end
+and corrupted neighbouring tensors.

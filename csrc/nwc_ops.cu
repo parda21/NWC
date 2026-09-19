@@ -45,7 +45,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-#define VERSION    9
+#define VERSION    10                   /* 9 = layout 0 only; 10 = layout 1 (tensor-core fragment order) added */
 #define LANES      32u
 #define ROWS       8u
 #define COLS       512u
@@ -59,6 +59,15 @@
 #define MAXR_FP8   10u                   /* FP8: 10 symbols, ranks 0..9 unary, no escape */
 #define ELEM_BF16  0
 #define ELEM_FP8   1                     /* fp8 e4m3 weights: 10-symbol code + 4-bit raw nibble plane */
+/* the elem parameter carries the element type in bits 0..3 and the layout in bits 4..7:
+   layout 0: 8 rows x 512 columns, lane = 16 consecutive columns of a row, FFMA accumulation (format v9)
+   layout 1: 16 rows x 512 columns, lane stream in mma.m16n8k16 A-fragment order, tensor-core accumulation
+             (sm_80+; FFMA fallback in the same order on sm_75), raw plane [row group][chunk][lane][8 | 4 bytes] */
+#define TYPE_OF(e)   ((e) & 15)
+#define LAYOUT_OF(e) (((e) >> 4) & 15)
+#define ROWS1      16u
+#define CHUNKS1    32u                  /* 16-column chunks per block (512 columns) */
+#define SCH1       16u                  /* 32-column super-chunks per block */
 #define FLAG       (1u << 30)
 #define TBP        1024u                 /* threads per persistent block */
 #define NPAIR      1024u                 /* size of freq/psym (Python bridge, compatible with v8) */
@@ -70,23 +79,32 @@
 
 /* Rounded-up dimensions of an M x K matrix (identical on host and device) */
 struct Shape {
-    uint32_t M, K, K16, Kp, CB, Mp, nb;
-    __host__ __device__ Shape(uint32_t M_, uint32_t K_) : M(M_), K(K_) {
-        K16 = (K + 15u) & ~15u; Kp = (K + COLS - 1) / COLS * COLS; CB = Kp / COLS; Mp = (M + ROWS - 1) / ROWS * ROWS;
-        nb = (Mp / ROWS) * CB;
+    uint32_t M, K, K16, Kp, CB, Mp, nb, rows, nl, nsl, spr;
+    __host__ __device__ Shape(uint32_t M_, uint32_t K_, int layout = 0) : M(M_), K(K_) {
+        rows = layout ? ROWS1 : ROWS;
+        K16 = (K + 15u) & ~15u; Kp = (K + COLS - 1) / COLS * COLS; CB = Kp / COLS; Mp = (M + rows - 1) / rows * rows;
+        nb = (Mp / rows) * CB;
+        nl = (K16 - (CB - 1) * COLS) / 16;                       /* layout 1: coded 16-column chunks in the last column block */
+        nsl = (nl + 1) / 2;                                       /* layout 1: 32-column super-chunks there */
+        spr = SCH1 * (CB - 1) + nsl;                              /* layout 1: super-chunk slots per row group (raw plane) */
     }
 };
 
 EXPORT int nwc_info(int what) {
     switch (what) { case 0: return VERSION; case 1: return 1; case 2: return (int)TAB_WORDS; case 3: return (int)HDR_BLOCK;
-                    case 4: return (int)BLOCK; case 5: return 1; /* elem parameter (0 BF16, 1 FP8) on all entry points */ }
+                    case 4: return (int)BLOCK; case 5: return 1; /* elem parameter (0 BF16, 1 FP8) on all entry points */
+                    case 6: return 1; /* layout 1 (tensor-core fragment order) supported: elem |= 16 */ }
     return -1;
 }
 /* bytes of the raw plane: BF16 one mantissa byte per weight, FP8 one nibble (row stride K16/2 bytes) */
-static uint64_t raw_bytes(const Shape &f, int elem) { return elem == ELEM_FP8 ? (uint64_t)f.M * (f.K16 / 2) : (uint64_t)f.M * f.K16; }
+static uint64_t raw_bytes(const Shape &f, int elem) {
+    const int t = TYPE_OF(elem);
+    if (LAYOUT_OF(elem)) return (uint64_t)(f.Mp / ROWS1) * f.spr * LANES * (t == ELEM_FP8 ? 8u : 16u);
+    return t == ELEM_FP8 ? (uint64_t)f.M * (f.K16 / 2) : (uint64_t)f.M * f.K16;
+}
 EXPORT int nwc_layout(uint64_t M, uint32_t K, int elem, uint64_t *out) {
     if (M == 0 || K == 0 || M > 0xFFFFFFFFull) return -1;
-    Shape f((uint32_t)M, K);
+    Shape f((uint32_t)M, K, LAYOUT_OF(elem));
     out[0] = f.nb; out[1] = raw_bytes(f, elem); out[2] = (uint64_t)f.Mp * f.CB; out[3] = f.K16;
     return 0;
 }
@@ -117,28 +135,40 @@ static int fp8_split(uint8_t b, uint8_t *sym, uint8_t *nib) {
 static inline uint32_t nib_byte(uint32_t j) { return (j & 3u) + ((j >> 3) << 2); }
 static inline uint32_t nib_high(uint32_t j) { return (j >> 2) & 1u; }
 
-EXPORT int64_t nwc_encode(const void *wv, uint64_t n, uint32_t K, int elem, uint16_t *freq, uint16_t *psym,
+/* layout 1: lane L = (r = L>>2, q = L&3) holds, per 32-column super-chunk, columns 8q..8q+7 of rows r and r+8: two
+   mma.m16n8k16 (h = 0: columns 8q..8q+3, h = 1: 8q+4..8q+7). Weight i (0..15) of the super-chunk in stream order:
+   h = i>>3, j = i&7: a-register j>>1 (a0 = row r cols +0,+1; a1 = row r+8 cols +0,+1; a2 = row r cols +2,+3; a3 = row
+   r+8 cols +2,+3), element j&1. The mma k index 2q,2q+1 maps to columns 8q+4h, +1 and k = 2q+8, 2q+9 to 8q+4h+2, +3;
+   the B fragment is x at the same columns, so a lane's x for a super-chunk is one 16-byte load. */
+static inline uint32_t frag_row(uint32_t L, uint32_t i) { return (L >> 2) + 8u * ((i >> 1) & 1u); }
+static inline uint32_t frag_col(uint32_t L, uint32_t i) { return 8u * (L & 3u) + 4u * ((i >> 3) & 1u) + 2u * ((i >> 2) & 1u) + (i & 1u); }
+
+EXPORT int64_t nwc_encode(const void *wv, uint64_t n, uint32_t K, int elem_code, uint16_t *freq, uint16_t *psym,
                           uint32_t *bases, uint8_t *hdr, uint8_t *data, uint64_t data_cap, uint8_t *low)
 {
     if (K == 0 || n % K || n / K > 0xFFFFFFFFull) return -1;
-    Shape f((uint32_t)(n / K), K);
+    const int elem = TYPE_OF(elem_code), layout = LAYOUT_OF(elem_code);
+    Shape f((uint32_t)(n / K), K, layout);
     const int NSYM = elem == ELEM_FP8 ? 10 : 128, MR = elem == ELEM_FP8 ? (int)MAXR_FP8 : (int)MAXR;
     uint8_t *high = (uint8_t*)malloc(n);                                   /* per weight: symbol (bit 7 = sign) */
+    uint8_t *raw = (uint8_t*)malloc(n);                                    /* per weight: mantissa byte / nibble */
     if (elem == ELEM_FP8) {
         const uint8_t *w = (const uint8_t*)wv;
-        memset(low, 0, raw_bytes(f, elem));
-        for (uint32_t m = 0; m < f.M; m++) for (uint32_t k = 0; k < f.K; k++) {
-            uint8_t b = w[(uint64_t)m * K + k], sym, nib;
-            if (fp8_split(b, &sym, &nib)) { free(high); return -2; }
-            high[(uint64_t)m * K + k] = (uint8_t)((b & 0x80u) | sym);
-            uint64_t o = (uint64_t)m * (f.K16 / 2) + (k / 16) * 8 + nib_byte(k & 15);
-            low[o] |= (uint8_t)(nib << (nib_high(k & 15) ? 4 : 0));
+        for (uint64_t i = 0; i < n; i++) {
+            uint8_t sym, nib;
+            if (fp8_split(w[i], &sym, &nib)) { free(high); free(raw); return -2; }
+            high[i] = (uint8_t)((w[i] & 0x80u) | sym); raw[i] = nib;
         }
     } else {
         const uint16_t *w = (const uint16_t*)wv;
-        for (uint32_t m = 0; m < f.M; m++) {                               /* mantissa plane with stride K16 */
-            for (uint32_t k = 0; k < f.K; k++) { uint16_t v = w[(uint64_t)m * K + k]; low[(uint64_t)m * f.K16 + k] = (uint8_t)v; high[(uint64_t)m * K + k] = (uint8_t)(v >> 8); }
-            for (uint32_t k = f.K; k < f.K16; k++) low[(uint64_t)m * f.K16 + k] = 0;
+        for (uint64_t i = 0; i < n; i++) { high[i] = (uint8_t)(w[i] >> 8); raw[i] = (uint8_t)w[i]; }
+    }
+    memset(low, 0, raw_bytes(f, elem_code));
+    if (!layout) {                                                         /* row-major raw plane, stride K16 (nibbles: K16/2) */
+        for (uint32_t m = 0; m < f.M; m++) for (uint32_t k = 0; k < f.K; k++) {
+            uint8_t v = raw[(uint64_t)m * K + k];
+            if (elem == ELEM_FP8) low[(uint64_t)m * (f.K16 / 2) + (k / 16) * 8 + nib_byte(k & 15)] |= (uint8_t)(v << (nib_high(k & 15) ? 4 : 0));
+            else low[(uint64_t)m * f.K16 + k] = v;
         }
     }
     /* ranks of the symbols by frequency */
@@ -152,20 +182,30 @@ EXPORT int64_t nwc_encode(const void *wv, uint64_t n, uint32_t K, int elem, uint
         psym[i] = (i < 16) ? (uint16_t)(elem == ELEM_FP8 ? (i < 10 ? FP8_BYTE3[ord[i]] : 0) : ord[i]) : 0;
     }
 
-    uint32_t words[BLOCK / LANES + 2];
+    uint32_t words[2 * BLOCK / LANES + 2];
     uint64_t pos = 0; int64_t rc = -1;
     for (uint32_t b = 0; b < f.nb; b++) {
         const uint32_t rb = b / f.CB, cb = b % f.CB;
+        const uint32_t nchunk = (cb == f.CB - 1) ? f.nl : CHUNKS1, slot0 = rb * f.spr + cb * SCH1;
         pos = (pos + ALIGN - 1) / ALIGN * ALIGN;
         bases[b] = (uint32_t)pos;
         for (uint32_t L = 0; L < LANES; L++) {
             BitWriter bw; bw.w = words; bw.n_w = 0; bw.acc = 0; bw.n = 0;
-            for (uint32_t i = 0; i < BLOCK / LANES; i++) {
-                uint32_t row = rb * ROWS + (i >> 4), col = cb * COLS + L * 16 + (i & 15);
+            const uint32_t nw = layout ? ((nchunk + 1) / 2) * 16 : BLOCK / LANES;   /* layout 1: whole super-chunks (fillers beyond K16) */
+            for (uint32_t i = 0; i < nw; i++) {
+                uint32_t row, col;
+                if (layout) { row = rb * ROWS1 + frag_row(L, i & 15); col = cb * COLS + (i >> 4) * 32 + frag_col(L, i & 15); }
+                else        { row = rb * ROWS + (i >> 4); col = cb * COLS + L * 16 + (i & 15); }
                 if (row >= f.M || col >= f.K) { bw.push(2, 2); continue; }               /* filler: rank 0, sign 0 */
-                uint8_t e = high[(uint64_t)row * K + col]; uint32_t r = rank_of_exp[e & 0x7F], s = e >> 7;
+                const uint64_t wi = (uint64_t)row * K + col;
+                uint8_t e = high[wi]; uint32_t r = rank_of_exp[e & 0x7F], s = e >> 7;
                 if ((int)r < MR) { bw.push(1, r + 1); bw.push(s, 1); }
                 else { bw.push(1, 16); bw.push(e, 8); }                                     /* BF16 only */
+                if (layout) {                                                              /* raw plane in stream order */
+                    const uint64_t o = ((uint64_t)(slot0 + (i >> 4)) * LANES + L);
+                    if (elem == ELEM_FP8) low[o * 8 + 4 * ((i >> 3) & 1) + (i & 3)] |= (uint8_t)(raw[wi] << (4 * ((i >> 2) & 1)));
+                    else low[o * 16 + (i & 15)] = raw[wi];
+                }
             }
             bw.finish();
             if (bw.n_w > 255 || pos + 4ull * bw.n_w + 64 > data_cap) goto done;
@@ -175,7 +215,7 @@ EXPORT int64_t nwc_encode(const void *wv, uint64_t n, uint32_t K, int elem, uint
     }
     rc = (int64_t)((pos + ALIGN - 1) / ALIGN * ALIGN + 64);                    /* 64 B slack: the window reads ahead */
 done:
-    free(high);
+    free(high); free(raw);
     return rc;
 }
 
@@ -183,7 +223,7 @@ static uint32_t clz32(uint32_t x) { uint32_t u = 0; if (!x) return 32; while (!(
 /* LUT: for every 12-bit pattern the first <= 2 complete codes */
 EXPORT void nwc_build_tab(const uint16_t *freq, const uint16_t *psym, int elem, uint32_t *lut) {
     (void)freq;
-    const uint32_t MR = elem == ELEM_FP8 ? MAXR_FP8 : MAXR;
+    const uint32_t MR = TYPE_OF(elem) == ELEM_FP8 ? MAXR_FP8 : MAXR;
     for (uint32_t pat = 0; pat < LUTN; pat++) {
         uint32_t bits = pat << (32 - PEEK), pos = 0, n = 0, c1 = 0, by[2] = {0, 0};
         for (int k = 0; k < 2; k++) {
@@ -455,6 +495,144 @@ kern_gather(const uint8_t *__restrict__ data, const uint32_t *__restrict__ bases
     }
 }
 
+/* ============================ Layout 1: tensor-core accumulation ============================ */
+/* bf16x2 <- two fp32 (a in the upper half, b in the lower) */
+__device__ __forceinline__ uint32_t pack_bf16x2(float hi, float lo) {
+    uint32_t r; asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo)); return r;
+}
+/* raw words of a lane's super-chunk: 4 words, word w holds the raw bytes of weights 4w..4w+3 (mma h = w>>1) */
+template<int ELEM>
+__device__ __forceinline__ uint4 raw_words1(const uint8_t *__restrict__ p) {
+    if (ELEM == ELEM_FP8) { uint2 v = __ldcs((const uint2*)p); return make_uint4((v.x << 4) & 0xF0F0F0F0u, v.x & 0xF0F0F0F0u, (v.y << 4) & 0xF0F0F0F0u, v.y & 0xF0F0F0F0u); }
+    return __ldcs((const uint4*)p);
+}
+#if __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void mma_bf16(float &d0, float &d1, float &d2, float &d3, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+#endif
+
+/* One warp per block of 16 rows x 512 columns = 16 super-chunks of 32 columns; lane (r = lane>>2, q = lane&3) decodes
+   rows r / r+8 at columns 8q..8q+7 of every super-chunk (two mma.m16n8k16 A fragments, one PRMT per pair). x enters as
+   the B fragment: one 16-byte load per lane and super-chunk; every lane loads x at its own columns, so all 8 columns of
+   D carry the same sums and lanes q == 0 hold the sums of rows r and r+8 after the block.
+   MODE 0: partial sums (x BF16[K32]), MODE 1: dequantization (BF16 row-major, stride K16), MODE 2: fp32 atomics (x fp32). */
+template<int MODE, int ELEM>
+__global__ void __launch_bounds__(TBP, 1)
+kern_block1(const uint8_t *__restrict__ data, const uint32_t *__restrict__ bases, const uint8_t *__restrict__ hdr,
+            const uint32_t *__restrict__ lut, const uint8_t *__restrict__ low, const float *__restrict__ x,
+            float *__restrict__ partial, uint16_t *__restrict__ out, uint32_t M, uint32_t K, uint32_t sh)
+{
+    extern __shared__ uint32_t smem[];
+    load_lut(smem, lut, threadIdx.x, TBP);
+    const uint8_t *exp_of_rank = (const uint8_t*)(smem + LUTN);
+    const uint32_t sm_lut = (uint32_t)__cvta_generic_to_shared(smem);
+    const uint32_t lane = threadIdx.x & 31, r = lane >> 2, q = lane & 3;
+    const Shape f(M, K, 1);
+    constexpr uint32_t MR = ELEM == ELEM_FP8 ? MAXR_FP8 : MAXR;
+    constexpr uint32_t RB = ELEM == ELEM_FP8 ? 8u : 16u;        /* raw bytes per lane and super-chunk */
+
+    for (uint32_t b = blockIdx.x * (TBP / 32) + (threadIdx.x >> 5); b < f.nb; b += gridDim.x * (TBP / 32)) {
+        const uint32_t rb = b / f.CB, cb = b - rb * f.CB, row0 = rb * ROWS1, k0 = cb * COLS + 8 * q;
+        const uint32_t nchunk = (cb == f.CB - 1) ? f.nl : CHUNKS1, nsc = (nchunk + 1) / 2;
+        const uint8_t *rp = low + ((uint64_t)(rb * f.spr + cb * SCH1) * LANES + lane) * RB;
+        Window W; W.setup(data, bases, hdr, b, lane);
+        float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+        uint4 nxt = raw_words1<ELEM>(rp);
+        #pragma unroll 1
+        for (uint32_t sc = 0; sc < nsc; sc++) {
+            const uint4 cw = nxt;
+            rp += LANES * RB;                                     /* next super-chunk, unconditional: the plane has slack */
+            nxt = raw_words1<ELEM>(rp);
+            const uint32_t kc = k0 + sc * 32;
+            uint4 xb4;
+            if (MODE == 0) xb4 = __ldg((const uint4*)((const uint16_t*)x + kc));   /* 8 BF16 = the lane's columns */
+            else if (MODE == 2) {
+                const float4 xa = __ldg((const float4*)(x + kc)), xc = __ldg((const float4*)(x + kc + 4));
+                xb4 = make_uint4(pack_bf16x2(xa.y, xa.x), pack_bf16x2(xa.w, xa.z), pack_bf16x2(xc.y, xc.x), pack_bf16x2(xc.w, xc.z));
+            }
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const uint32_t c0 = h ? cw.z : cw.x, c1 = h ? cw.w : cw.y;
+                const uint32_t e0 = W.pair<MR>(sm_lut, sh, exp_of_rank), e1 = W.pair<MR>(sm_lut, sh, exp_of_rank);
+                const uint32_t e2 = W.pair<MR>(sm_lut, sh, exp_of_rank), e3 = W.pair<MR>(sm_lut, sh, exp_of_rank);
+                if (MODE == 1) {
+                    uint16_t *o = out + (uint64_t)row0 * f.K16 + kc + 4 * h;
+                    if (kc + 4 * h >= f.K16) continue;                                    /* filler columns of a half super-chunk */
+                    if (row0 + r < f.M)     { *(uint32_t*)(o + (uint64_t)r * f.K16) = two_bf16(c0, e0, 0); *(uint32_t*)(o + (uint64_t)r * f.K16 + 2) = two_bf16(c1, e2, 0); }
+                    if (row0 + r + 8 < f.M) { *(uint32_t*)(o + (uint64_t)(r + 8) * f.K16) = two_bf16(c0, e1, 2); *(uint32_t*)(o + (uint64_t)(r + 8) * f.K16 + 2) = two_bf16(c1, e3, 2); }
+                } else {
+                    const uint32_t b0 = h ? xb4.z : xb4.x, b1 = h ? xb4.w : xb4.y;
+#if __CUDA_ARCH__ >= 800
+                    mma_bf16(d0, d1, d2, d3, two_bf16(c0, e0, 0), two_bf16(c0, e1, 2), two_bf16(c1, e2, 0), two_bf16(c1, e3, 2), b0, b1);
+#else
+                    /* sm_75: no bf16 tensor cores -> FFMA in the same order; d0 = row r, d2 = row r + 8 (this lane's columns) */
+                    const float x0 = __uint_as_float(b0 << 16), x1 = __uint_as_float(b0 & 0xFFFF0000u), x2 = __uint_as_float(b1 << 16), x3 = __uint_as_float(b1 & 0xFFFF0000u);
+                    d0 = fmaf(weight_f32(c0, e0, (5 << 12) | (0 << 8) | 0xFF), x0, d0); d0 = fmaf(weight_f32(c0, e0, (6 << 12) | (1 << 8) | 0xFF), x1, d0);
+                    d2 = fmaf(weight_f32(c0, e1, (5 << 12) | (2 << 8) | 0xFF), x0, d2); d2 = fmaf(weight_f32(c0, e1, (6 << 12) | (3 << 8) | 0xFF), x1, d2);
+                    d0 = fmaf(weight_f32(c1, e2, (5 << 12) | (0 << 8) | 0xFF), x2, d0); d0 = fmaf(weight_f32(c1, e2, (6 << 12) | (1 << 8) | 0xFF), x3, d0);
+                    d2 = fmaf(weight_f32(c1, e3, (5 << 12) | (2 << 8) | 0xFF), x2, d2); d2 = fmaf(weight_f32(c1, e3, (6 << 12) | (3 << 8) | 0xFF), x3, d2);
+#endif
+                }
+            }
+        }
+        if (MODE != 1) {
+#if __CUDA_ARCH__ < 800
+            d0 += __shfl_xor_sync(0xffffffffu, d0, 1); d0 += __shfl_xor_sync(0xffffffffu, d0, 2);   /* the 4 lanes of a row */
+            d2 += __shfl_xor_sync(0xffffffffu, d2, 1); d2 += __shfl_xor_sync(0xffffffffu, d2, 2);
+#endif
+            (void)d1; (void)d3;
+            if (q == 0) {
+                if (MODE == 0) { partial[(uint64_t)(row0 + r) * f.CB + cb] = d0; partial[(uint64_t)(row0 + r + 8) * f.CB + cb] = d2; }
+                else { if (row0 + r < f.M) atomicAdd(partial + row0 + r, d0); if (row0 + r + 8 < f.M) atomicAdd(partial + row0 + r + 8, d2); }
+            }
+        }
+    }
+}
+
+/* Row gather for layout 1: one warp per requested row; the row group's streams are decoded, the lanes of the row's
+   quad write their pairs */
+template<int ELEM>
+__global__ void __launch_bounds__(128)
+kern_gather1(const uint8_t *__restrict__ data, const uint32_t *__restrict__ bases, const uint8_t *__restrict__ hdr,
+             const uint32_t *__restrict__ lut, const uint8_t *__restrict__ low, const int64_t *__restrict__ ids,
+             uint32_t n_ids, uint16_t *__restrict__ out, uint32_t M, uint32_t K, uint32_t sh)
+{
+    __shared__ uint32_t smem[LUTN + 4];
+    load_lut(smem, lut, threadIdx.x, blockDim.x);
+    const uint8_t *exp_of_rank = (const uint8_t*)(smem + LUTN);
+    const uint32_t sm_lut = (uint32_t)__cvta_generic_to_shared(smem);
+    uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31, r = lane >> 2, q = lane & 3;
+    if (warp >= n_ids) return;
+    int64_t R = ids[warp];
+    if (R < 0 || R >= (int64_t)M) return;
+    const Shape f(M, K, 1);
+    constexpr uint32_t MR = ELEM == ELEM_FP8 ? MAXR_FP8 : MAXR;
+    constexpr uint32_t RB = ELEM == ELEM_FP8 ? 8u : 16u;
+    const uint32_t rb = (uint32_t)R / ROWS1, rr = (uint32_t)R % ROWS1;
+    const bool mine = (rr & 7u) == r, hi = rr >= 8;
+    uint16_t *o = out + (uint64_t)warp * f.K16;
+    for (uint32_t cb = 0; cb < f.CB; cb++) {
+        const uint32_t nchunk = (cb == f.CB - 1) ? f.nl : CHUNKS1, nsc = (nchunk + 1) / 2;
+        const uint8_t *rp = low + ((uint64_t)(rb * f.spr + cb * SCH1) * LANES + lane) * RB;
+        Window W; W.setup(data, bases, hdr, rb * f.CB + cb, lane);
+        for (uint32_t sc = 0; sc < nsc; sc++) {
+            const uint4 cw = raw_words1<ELEM>(rp + (uint64_t)sc * LANES * RB);
+            for (int h = 0; h < 2; h++) {
+                const uint32_t c0 = h ? cw.z : cw.x, c1 = h ? cw.w : cw.y;
+                const uint32_t e0 = W.pair<MR>(sm_lut, sh, exp_of_rank), e1 = W.pair<MR>(sm_lut, sh, exp_of_rank);
+                const uint32_t e2 = W.pair<MR>(sm_lut, sh, exp_of_rank), e3 = W.pair<MR>(sm_lut, sh, exp_of_rank);
+                const uint32_t kc = cb * COLS + sc * 32 + 8 * q + 4 * h;
+                if (mine && kc < f.K16) {
+                    *(uint32_t*)(o + kc) = hi ? two_bf16(c0, e1, 2) : two_bf16(c0, e0, 0);
+                    *(uint32_t*)(o + kc + 2) = hi ? two_bf16(c1, e3, 2) : two_bf16(c1, e2, 0);
+                }
+            }
+        }
+    }
+}
+
 /* Reference "native" fp8 weight-only matvec: y[i] = scale[i] * sum_k fp8[i,k] * x[k]. The bandwidth baseline NWC-FP8 is
    compared with. One warp per 4 rows, 16 weights per lane and iteration (uint4 loads), x fp32[K16] (zeros beyond K)
    converted to half2 once per 16-column chunk and shared by the 4 rows. sm_89+: hardware e4m3x2 -> f16x2 conversion and
@@ -552,12 +730,30 @@ static void launch_mode(int bl, cudaStream_t st, const uint8_t *data, const uint
                         const uint32_t *tab, const uint8_t *low, const float *x, float *partial, uint16_t *out, const Shape &f) {
     kern_block<MODE, ELEM><<<bl, TBP, SMEM, st>>>(data, bases, hdr, tab, low, x, partial, out, f.M, f.K, SH);
 }
-static int launch_block(int mode, int elem, cudaStream_t st, const uint8_t *data, const uint32_t *bases, const uint8_t *hdr,
+template<int MODE, int ELEM>
+static void launch_mode1(int bl, cudaStream_t st, const uint8_t *data, const uint32_t *bases, const uint8_t *hdr,
+                         const uint32_t *tab, const uint8_t *low, const float *x, float *partial, uint16_t *out, const Shape &f) {
+    kern_block1<MODE, ELEM><<<bl, TBP, SMEM, st>>>(data, bases, hdr, tab, low, x, partial, out, f.M, f.K, SH);
+}
+static int launch_block(int mode, int elem_code, cudaStream_t st, const uint8_t *data, const uint32_t *bases, const uint8_t *hdr,
                         const uint32_t *tab, const uint8_t *low, const float *x, float *partial, uint16_t *out, uint64_t n, uint32_t K)
 {
     if (g_sms == 0) nwc_setup();
-    Shape f((uint32_t)(n / K), K);
+    const int elem = TYPE_OF(elem_code), layout = LAYOUT_OF(elem_code);
+    Shape f((uint32_t)(n / K), K, layout);
     int bl = (int)((f.nb + TBP / 32 - 1) / (TBP / 32)); if (bl > g_sms) bl = g_sms;
+    if (layout) {
+        if (elem == ELEM_FP8) {
+            if (mode == 0)      launch_mode1<0, ELEM_FP8>(bl, st, data, bases, hdr, tab, low, x, partial, out, f);
+            else if (mode == 1) launch_mode1<1, ELEM_FP8>(bl, st, data, bases, hdr, tab, low, x, partial, out, f);
+            else                launch_mode1<2, ELEM_FP8>(bl, st, data, bases, hdr, tab, low, x, partial, out, f);
+        } else {
+            if (mode == 0)      launch_mode1<0, ELEM_BF16>(bl, st, data, bases, hdr, tab, low, x, partial, out, f);
+            else if (mode == 1) launch_mode1<1, ELEM_BF16>(bl, st, data, bases, hdr, tab, low, x, partial, out, f);
+            else                launch_mode1<2, ELEM_BF16>(bl, st, data, bases, hdr, tab, low, x, partial, out, f);
+        }
+        return (int)cudaGetLastError();
+    }
     if (elem == ELEM_FP8) {
         if (mode == 0)      launch_mode<0, ELEM_FP8>(bl, st, data, bases, hdr, tab, low, x, partial, out, f);
         else if (mode == 1) launch_mode<1, ELEM_FP8>(bl, st, data, bases, hdr, tab, low, x, partial, out, f);
@@ -588,15 +784,15 @@ EXPORT int nwc_dequant(void *stream, const uint8_t *data, const uint32_t *bases,
     return launch_block(1, elem, (cudaStream_t)stream, data, bases, hdr, tab, low, NULL, NULL, out, n, K);
 }
 
-/* x fp32 (K16, zeros beyond K), bias BF16 (M) or NULL, scale fp32 (M) or NULL (FP8 per-row scale), y BF16 (M);
-   scratch fp32[Mp * CB] */
+/* x fp32[K16] (zeros beyond K) for layout 0, BF16[K32] (K rounded up to 32, zeros beyond K) for layout 1; bias BF16 (M)
+   or NULL, scale fp32 (M) or NULL (FP8 per-row scale), y BF16 (M); scratch fp32[Mp * CB] */
 EXPORT int nwc_linear_bf16(void *stream, const uint8_t *data, const uint32_t *bases, const uint8_t *hdr,
                            const uint32_t *tab, const uint8_t *low, const float *x, const uint16_t *bias, const float *scale,
                            float *scratch, uint16_t *y, uint64_t n, uint32_t block, uint32_t K, int elem)
 {
     if (!shape_ok(n, block, K)) return -1;
     cudaStream_t st = (cudaStream_t)stream;
-    Shape f((uint32_t)(n / K), K);
+    Shape f((uint32_t)(n / K), K, LAYOUT_OF(elem));
     int rc = launch_block(0, elem, st, data, bases, hdr, tab, low, x, scratch, NULL, n, K);
     if (rc) return rc;
     kern_f32_to_bf16_bias<<<(f.M + 255) / 256, 256, 0, st>>>(scratch, bias, scale, y, f.M, f.CB);
@@ -610,8 +806,12 @@ EXPORT int nwc_gather(void *stream, const uint8_t *data, const uint32_t *bases, 
     if (!shape_ok(n, block, K)) return -1;
     if (n_ids == 0) return 0;
     cudaStream_t st = (cudaStream_t)stream;
-    if (elem == ELEM_FP8) kern_gather<ELEM_FP8><<<(n_ids * 32 + 127) / 128, 128, 0, st>>>(data, bases, hdr, tab, low, ids, n_ids, out, (uint32_t)(n / K), K, SH);
-    else                  kern_gather<ELEM_BF16><<<(n_ids * 32 + 127) / 128, 128, 0, st>>>(data, bases, hdr, tab, low, ids, n_ids, out, (uint32_t)(n / K), K, SH);
+    const unsigned gb = (n_ids * 32 + 127) / 128; const uint32_t Mr = (uint32_t)(n / K);
+    if (LAYOUT_OF(elem)) {
+        if (TYPE_OF(elem) == ELEM_FP8) kern_gather1<ELEM_FP8><<<gb, 128, 0, st>>>(data, bases, hdr, tab, low, ids, n_ids, out, Mr, K, SH);
+        else                           kern_gather1<ELEM_BF16><<<gb, 128, 0, st>>>(data, bases, hdr, tab, low, ids, n_ids, out, Mr, K, SH);
+    } else if (elem == ELEM_FP8) kern_gather<ELEM_FP8><<<gb, 128, 0, st>>>(data, bases, hdr, tab, low, ids, n_ids, out, Mr, K, SH);
+    else                         kern_gather<ELEM_BF16><<<gb, 128, 0, st>>>(data, bases, hdr, tab, low, ids, n_ids, out, Mr, K, SH);
     return (int)cudaGetLastError();
 }
 
@@ -632,5 +832,11 @@ EXPORT int nwc_setup(void) {
     cudaFuncSetAttribute(kern_block<0, ELEM_FP8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     cudaFuncSetAttribute(kern_block<1, ELEM_FP8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     cudaFuncSetAttribute(kern_block<2, ELEM_FP8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    cudaFuncSetAttribute(kern_block1<0, ELEM_BF16>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    cudaFuncSetAttribute(kern_block1<1, ELEM_BF16>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    cudaFuncSetAttribute(kern_block1<2, ELEM_BF16>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    cudaFuncSetAttribute(kern_block1<0, ELEM_FP8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    cudaFuncSetAttribute(kern_block1<1, ELEM_FP8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    cudaFuncSetAttribute(kern_block1<2, ELEM_FP8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     return g_sms;
 }

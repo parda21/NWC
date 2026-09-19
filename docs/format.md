@@ -131,6 +131,21 @@ Size on Qwen3-4B: 6.9 bits per weight, 0.866 of fp8 (`scripts/entropy_quant.py`;
 split reaches 0.862, on the full 4-bit exponent 0.828). int8 was measured and rejected: the rank code reaches
 only 0.95 of int8 because the alphabet is flat; that needs a rANS-class coder.
 
+## 4c. Layout 1: tensor-core fragment order (format v10)
+
+`elem` bits 4..7 select the block layout. Layout 0 is the one above. Layout 1 uses blocks of **16 rows × 512
+columns** and orders each lane's stream for `mma.m16n8k16`: lane L = (r = L >> 2, q = L & 3) holds, per 32-column
+super-chunk, the columns 8q..8q+7 of rows r and r+8, as 16 weights in the order (mma h = 0: columns +0..+3, h = 1:
++4..+7; within an mma: a0 = row r columns +0,+1; a1 = row r+8 columns +0,+1; a2 = row r columns +2,+3; a3 = row r+8
+columns +2,+3). The mma k index 2q, 2q+1 maps to columns 8q+4h, +1 and k = 2q+8, 2q+9 to 8q+4h+2, +3, so the B
+fragment of a lane is x at its own eight columns, one 16-byte load per super-chunk. The raw plane is
+`[row group][super-chunk slot][lane][16 bytes]` (fp8: 8 bytes, word w low nibbles = weights 4w..4w+3 of ... as in
+layout 0, expanded with one shift and one mask); super-chunk slots per row group = 16 · (CB − 1) + ⌈nl / 2⌉ with
+nl the 16-column chunks of the last column block; whole super-chunks are coded at the right edge (fillers beyond
+`K16`). The Python side pads x to a multiple of 32 and appends 512 bytes of slack to the raw plane because the
+kernel loads one super-chunk ahead. Dequantization writes bf16x2 pairs into the row-major output, guarded by
+column < `K16`. Measured effect: docs/results.md, section 9.
+
 ## 5. Library interface (`nwc_ops.dll` / `nwc_ops.so`)
 
 | export | purpose |
@@ -158,3 +173,4 @@ older libraries (v7/v8) for A/B comparisons via the `NWC_DLL` environment variab
 | 7 | rANS on exponent pairs, two states per lane | | halves gathers per weight; A16 0.53× → 0.74× |
 | 8 | rANS pairs, one 64-bit state, 32-bit renorm | 4096 | 32-bit table `[pair 16 \| freq 8 \| bias 8]`, escape side stream, persistent blocks with table and x in shared memory; A16 0.73–0.78× |
 | **9** | **prefix code + LUT** | **8 rows × 512 columns** | **A16 1.06–1.18×** |
+| **10** | as 9, plus fp8 element type and layout 1 (tensor-core fragment order, 16 × 512) | | fp8 on the A16 0.72× → 0.80× of native fp8 |

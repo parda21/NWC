@@ -8,7 +8,7 @@ import torch
 from nwc.nwc_torch import NWCWeight, VERSION, FIXED_BLOCK, HDR_BLOCK, LANES
 
 ROWS, COLS, PEEK, MAXR, FLAG = 8, 512, 12, 15, 1 << 30
-assert VERSION == 9 and FIXED_BLOCK == ROWS * COLS and HDR_BLOCK == LANES
+assert VERSION in (9, 10) and FIXED_BLOCK == ROWS * COLS and HDR_BLOCK == LANES
 
 
 def exp_of_rank(lut):
@@ -34,42 +34,62 @@ class Bits:
 
 
 def decode(c: NWCWeight) -> torch.Tensor:
+    """Both layouts. Layout 1: 16-row blocks, lane L = (r = L >> 2, q = L & 3) holds, per 32-column super-chunk, weight
+    i (0..15) at row r + 8 * ((i >> 1) & 1), column 8q + 4 * ((i >> 3) & 1) + 2 * ((i >> 2) & 1) + (i & 1) (two
+    mma.m16n8k16 A fragments); the raw plane is [row group][super-chunk slot][lane][16 bytes]; 16-column chunks with
+    columns >= K16 are not coded (an odd count leaves the last super-chunk half full)."""
     M, K, K16 = c.out_features, c.in_features, c.K16
     CB = (K + COLS - 1) // COLS
+    rows = 16 if c.layout else ROWS
+    nl = (K16 - (CB - 1) * COLS) // 16; nsl = (nl + 1) // 2; spr = 16 * (CB - 1) + nsl
     data, bases, hdr, low = bytes(c.data.cpu().tolist()), c.bases.cpu().tolist(), c.hdr.cpu().tolist(), c.low.cpu()
     eor = exp_of_rank(c.lut.cpu().tolist())
     high = torch.zeros(M, K, dtype=torch.int32)
+    lo = torch.zeros(M, K, dtype=torch.int32)
     for b in range(len(bases)):
         rb, cb = divmod(b, CB)
         pos = bases[b]
+        nchunk = nl if cb == CB - 1 else 32
         for L in range(LANES):
             n_words = hdr[b * HDR_BLOCK + L]
             r = Bits(data, pos, n_words); pos += 4 * n_words
-            for i in range(ROWS * COLS // LANES):
-                row, col = rb * ROWS + (i >> 4), cb * COLS + L * 16 + (i & 15)
+            nw = ((nchunk + 1) // 2) * 16 if c.layout else ROWS * COLS // LANES
+            for i in range(nw):
+                if c.layout:
+                    j = i & 15
+                    row = rb * 16 + (L >> 2) + 8 * ((j >> 1) & 1)
+                    col = cb * COLS + (i >> 4) * 32 + 8 * (L & 3) + 4 * ((j >> 3) & 1) + 2 * ((j >> 2) & 1) + (j & 1)
+                else:
+                    row, col = rb * ROWS + (i >> 4), cb * COLS + L * 16 + (i & 15)
                 zeros = 0
                 while r.bit() == 0: zeros += 1
                 if zeros < MAXR: sign = r.bit(); e = (sign << 7) | eor[zeros]   # rank code + sign
                 else: sign = None; e = r.bits(8)                                  # escape: raw byte
-                if row < M and col < K: high[row, col] = e
+                if row < M and col < K:
+                    high[row, col] = e
+                    if c.layout: lo[row, col] = int(low[((rb * spr + cb * 16 + (i >> 4)) * LANES + L) * 16 + j])
                 else: assert zeros == 0 and sign == 0, "filler weights are coded as rank 0, sign 0"
-    lo = low.view(M, K16)[:, :K].to(torch.int32)
+    if not c.layout: lo = low[:M * K16].view(M, K16)[:, :K].to(torch.int32)
     return ((high << 8) | lo).to(torch.int16).view(torch.bfloat16)
 
 
-def check(M, K, scale=0.02, seed=0):
+def check(M, K, scale=0.02, seed=0, layout=0):
     torch.manual_seed(seed)
     w = (torch.randn(M, K) * scale).to(torch.bfloat16)
     w.view(-1)[:: max(1, M * K // 50)] = torch.tensor(1e30, dtype=torch.bfloat16)   # rare exponents -> escapes
-    c = NWCWeight(w, device="cpu")
+    c = NWCWeight(w, device="cpu", layout=layout)
     back = decode(c)
     ok = torch.equal(back, w)
-    print(f"{M:>5} x {K:<5}  {c.bytes/1e3:8.1f} KB, ratio {c.bytes/c.bytes_bf16:.3f}, blocks {c.bases.numel():4d}  ->  "
+    print(f"layout {layout}: {M:>5} x {K:<5}  {c.bytes/1e3:8.1f} KB, ratio {c.bytes/c.bytes_bf16:.3f}, blocks {c.bases.numel():4d}  ->  "
           f"{'bit-exact' if ok else 'MISMATCH'}")
     return ok
 
 
 if __name__ == "__main__":
-    results = [check(8, 512), check(13, 40), check(3, 4097), check(100, 1000, scale=1.0), check(64, 2048, seed=1)]
+    from nwc.nwc_torch import LAYOUT1
+    results = []
+    for layout in ([0, 1] if LAYOUT1 else [0]):
+        results += [check(8, 512, layout=layout), check(13, 40, layout=layout), check(3, 4097, layout=layout),
+                    check(100, 1000, scale=1.0, layout=layout), check(64, 2048, seed=1, layout=layout), check(17, 520, layout=layout)]
     print("OK" if all(results) else "FAIL")
     sys.exit(0 if all(results) else 1)

@@ -12,6 +12,7 @@ from safetensors.torch import save_file, load_file
 from .nwc_torch import NWCWeight, NWCLinear, NWCEmbedding, _FusedHead, VERSION
 
 FORMAT = 1
+COMPATIBLE = {9, VERSION}          # v9 checkpoints (layout 0) load into the v10 library
 TENSOR_NAMES = ("data", "bases", "hdr", "lut", "low")
 
 
@@ -22,7 +23,7 @@ def _collect(model):
         if id(w) not in ids:
             ids[id(w)] = len(weights)
             weights.append({"id": len(weights), "out": w.out_features, "in": w.in_features, "block": w.block, "bytes": w.bytes,
-                            "elem": "fp8" if w.elem else "bf16", "w": w})
+                            "elem": "fp8" if w.elem else "bf16", "layout": w.layout, "w": w})
         return ids[id(w)]
     groups = set()
     for path, m in model.named_modules():
@@ -90,7 +91,7 @@ def load_pretrained(path: str, device="cuda", verbose=True):
         raise FileNotFoundError(f"{path} is not an NWC checkpoint (no nwc_config.json); a plain HF model is compressed with "
                                 "nwc.convert or `python -m nwc.demo MODEL` without --load")
     with open(os.path.join(path, "nwc_config.json"), encoding="utf-8") as f: config = json.load(f)
-    if config["library_version"] != VERSION:
+    if config["library_version"] not in COMPATIBLE:
         raise RuntimeError(f"checkpoint is format version {config['library_version']}, library is {VERSION}")
     hf_config = AutoConfig.from_pretrained(path)
     with init_empty_weights():
@@ -101,7 +102,7 @@ def load_pretrained(path: str, device="cuda", verbose=True):
     for e in config["weights"]:
         t = {n: tensors.pop(f"nwc/{e['id']}/{n}") for n in TENSOR_NAMES}
         weights[e["id"]] = NWCWeight.from_tensors(e["out"], e["in"], e["block"], t["data"], t["bases"], t["hdr"], t["lut"], t["low"], device,
-                                                  elem=e.get("elem", "bf16"), scale=tensors.pop(f"nwc/{e['id']}/scale", None))
+                                                  elem=e.get("elem", "bf16"), scale=tensors.pop(f"nwc/{e['id']}/scale", None), layout=e.get("layout", 0))
     for m in config["modules"]:
         w = weights[m["weight"]]
         if m["kind"] == "linear":
@@ -133,7 +134,7 @@ def export_bf16(path: str, out: str, device="cuda", verbose=True):
     import shutil
     path = resolve(path)
     with open(os.path.join(path, "nwc_config.json"), encoding="utf-8") as f: config = json.load(f)
-    if config["library_version"] != VERSION:
+    if config["library_version"] not in COMPATIBLE:
         raise RuntimeError(f"checkpoint is format version {config['library_version']}, library is {VERSION}")
     with open(os.path.join(path, "config.json"), encoding="utf-8") as f: tied = json.load(f).get("tie_word_embeddings", False)
     tensors = load_file(os.path.join(path, "model.safetensors"))
@@ -142,7 +143,7 @@ def export_bf16(path: str, out: str, device="cuda", verbose=True):
     for e in config["weights"]:
         t = {n: tensors.pop(f"nwc/{e['id']}/{n}") for n in TENSOR_NAMES}
         w = NWCWeight.from_tensors(e["out"], e["in"], e["block"], t["data"], t["bases"], t["hdr"], t["lut"], t["low"], device,
-                                   elem=e.get("elem", "bf16"), scale=tensors.pop(f"nwc/{e['id']}/scale", None))
+                                   elem=e.get("elem", "bf16"), scale=tensors.pop(f"nwc/{e['id']}/scale", None), layout=e.get("layout", 0))
         full = w.dequant()
         if w.scale is not None: full = (full.float() * w.scale[:, None]).to(torch.bfloat16)   # fp8 x scale, rounded to BF16
         full = full.contiguous().cpu(); del w

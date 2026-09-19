@@ -72,6 +72,11 @@ output is pasted into the release notes.
 - `__byte_perm` ignores the sign-replication bit of the selector; use inline `prmt.b32`.
 - Building a random test model with `.to(torch.bfloat16)` converts `inv_freq` buffers too; use
   `from_config(cfg, dtype=torch.bfloat16)`.
+- Memory instructions per pair decide the decoder's speed on both Ampere and Ada, not the ALU count: the
+  tensor-core layout only paid off once x and the raw bytes came in as one 16-byte load per two mma each
+  (docs/results.md, section 9). Knock things out and measure before believing an instruction count.
+- Out-of-bounds stores in a dequantization kernel corrupt *other* tensors and show up as wrong matvec results
+  later; when an odd-shape test fails on several fronts at once, suspect a store guard first.
 
 ## Definition of done
 

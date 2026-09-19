@@ -25,6 +25,7 @@ fits a 12 GB card.
 
 ## News
 
+- **main** · tensor-core accumulation layout (format v10, opt-in `layout=1`): fp8 kernels on the A16 9–13 % faster, at parity on the 4070; v9 checkpoints keep loading ([docs/results.md](docs/results.md), section 9).
 - **main** · fp8: weight-only fp8 e4m3 models (per-channel scale) with the fp8 values stored lossless, 0.87 of the
   fp8 size, same speed as a native fp8 matvec on the RTX 4070 and 1.2–2.1× cuBLAS BF16 (`--fp8` in the demo,
   `convert(model, elem="fp8")`; [docs/results.md](docs/results.md), section 8).
@@ -62,7 +63,8 @@ export_bf16("my-model-NWC", "my-model")                 # back to a plain BF16 c
 The converted model is a normal Transformers model: `generate`, chat templates, `StaticCache` and CUDA graphs all
 work. Batch 1 runs through the fused kernel; prefill dequantizes into a temporary buffer and calls cuBLAS.
 `convert(model, elem="fp8")` (demo: `--fp8`) quantizes to weight-only fp8 e4m3 first and stores the fp8 values
-lossless: 0.43 of the BF16 size, and on the RTX 4070 as fast as a native fp8 matvec.
+lossless: Qwen3-4B in 3.61 GB of VRAM at 73.6 tokens/s on the RTX 4070 (native BF16: 8.10 GB, 45 tokens/s), the
+kernel as fast as a native fp8 matvec. Ready-made: [Parda21/Qwen3-4B-NWC-fp8](https://huggingface.co/Parda21/Qwen3-4B-NWC-fp8).
 
 ## Results
 
@@ -142,7 +144,7 @@ Tracked in [milestones](https://github.com/parda21/NWC/milestones) and
 - [x] v0.9 · format v9, A16 parity, shape-independent, PyPI wheels (Windows, Linux), HF checkpoints, CI
 - [x] v0.10 · fp8 weight-only element type (fp8 values lossless, 0.87 of fp8 size, native-fp8 speed on Ada)
 - [ ] v0.10 · measure RTX 4080 Super ([#1](https://github.com/parda21/NWC/issues/1)) and H100 ([#2](https://github.com/parda21/NWC/issues/2)); community results into the hardware table ([#8](https://github.com/parda21/NWC/issues/8))
-- [ ] v0.10 · tensor-core accumulation path (`mma.m16n8k16`) for A100 / H100 SXM parity ([#3](https://github.com/parda21/NWC/issues/3)); also the lever for fp8 speed beyond parity
+- [x] v0.10 · tensor-core accumulation layout (`mma.m16n8k16`): built and measured ([#3](https://github.com/parda21/NWC/issues/3)); fp8 on the A16 +9–13 %, BF16 at parity, so the H100 question stays open and moves to wider stream refills
 - [ ] v0.10 · why does Ada need 17 SM clocks per warp step where Ampere needs 11? (same SASS; docs/results.md section 8)
 - [ ] v0.10 · second model family (Llama 3.1 8B, Mistral) with perplexity check ([#4](https://github.com/parda21/NWC/issues/4)); Colab notebook on a T4 ([#5](https://github.com/parda21/NWC/issues/5))
 - [ ] v1.0 · llama.cpp port (GGML tensor type, CUDA mmv kernel, converter), the road to Ollama / LM Studio ([#6](https://github.com/parda21/NWC/issues/6))

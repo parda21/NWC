@@ -16,6 +16,7 @@ ap.add_argument("--warm", default="", help="data|low|both: load into the L2 befo
 ap.add_argument("--all", action="store_true", help="also time dequant and the fp32 matvec")
 ap.add_argument("--copies-mb", type=int, default=160, help="working set per shape (L2 of the 4070 = 36 MB)")
 ap.add_argument("--elem", default="bf16", choices=["bf16", "fp8"], help="fp8: NWC-fp8 vs the reference fp8 weight-only matvec (and cuBLAS BF16 for context)")
+ap.add_argument("--layout", type=int, default=None, help="0: 8-row blocks, FFMA; 1: 16-row blocks, tensor-core fragment order (default: library default)")
 a = ap.parse_args()
 
 # (name, M = out, K = in): Qwen3-4B with fused qkv / gate+up, plus lm_head
@@ -42,11 +43,11 @@ for name, M, K in SHAPES:
     w = torch.frombuffer(bytearray(raw[:n * 2]), dtype=torch.int16).view(M, K).view(torch.bfloat16)
     block = a.block or choose_block(n)
     nk = max(1, min(8, a.copies_mb * 1000000 // (2 * n)))
-    nws = [NWCWeight(w, block=block, elem=a.elem) for _ in range(nk)]; nw = nws[0]
+    nws = [NWCWeight(w, block=block, elem=a.elem, layout=a.layout) for _ in range(nk)]; nw = nws[0]
     wcs = [w.cuda() for _ in range(nk)]; wc = wcs[0]
     xb = (torch.rand(K) - 0.5).cuda().to(torch.bfloat16); bias = torch.zeros(M, dtype=torch.bfloat16).cuda()
     it = [0]
-    xn = xb.float() if X_FP32 else xb            # v8+: convert x beforehand (otherwise the event times the CPU dispatch of the cast)
+    xn = xb if nw.layout else (xb.float() if X_FP32 else xb)   # convert x beforehand (otherwise the event times the cast); layout 1 takes BF16
     def fcublas(): it[0] += 1; return torch.nn.functional.linear(xb, wcs[it[0] % nk], bias)
     if a.elem == "fp8":                            # baseline: the library's fp8 weight-only matvec on the same fp8 values
         q, scale = quantize_fp8(w); q8s = [q.cuda().contiguous() for _ in range(nk)]; sc = scale.cuda()
