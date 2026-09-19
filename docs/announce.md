@@ -31,7 +31,9 @@ Compared with DFloat11 (same 30 %, Huffman, decode into a buffer then matmul): s
 takes 2.7× the native GPU time per token on the 4070 because the decoded weights pass through memory
 twice.
 
-Apache-2.0, `pip install neural-weight-compression`, `python -m nwc.demo Qwen/Qwen3-4B`.
+Apache-2.0, `pip install neural-weight-compression`, then `python -m nwc.doctor` and
+`python -m nwc.demo Parda21/Qwen3-4B-NWC --load --graph` (ready-made checkpoint; a 0.8 GB one for a one-minute
+smoke test is there too). No lock-in: `python -m nwc.export` gives the BF16 checkpoint back bit for bit.
 Limits: batch-1 decoding is the fast path; prefill only saves memory. HBM parts need more decoder
 throughput per SM; a tensor-core accumulation path is the next step.
 
@@ -51,8 +53,12 @@ and on my 4070 the logits are bit-identical to the unmodified model.
 - vs DFloat11: same size, but 2.7× faster on the 4070 (they decode into a buffer, NWC decodes in the kernel)
 
 Works with HF Transformers: `fuse(model); convert(model)` replaces every nn.Linear. Compressed checkpoints
-can be saved and loaded without the original weights (`save_pretrained` / `load_pretrained`). Windows and
-Linux wheels with prebuilt kernels for sm_80–sm_90.
+can be saved and loaded without the original weights (`save_pretrained` / `load_pretrained`), and exported back
+to plain BF16 bit for bit, so there is no lock-in. Ready-made checkpoints on HF (Qwen3-4B, and a 0.6B for a
+one-minute smoke test); `python -m nwc.doctor` tells you whether your setup works before you download anything.
+Windows and Linux wheels with prebuilt kernels for sm_75–sm_90 (Blackwell via PTX).
+
+Not yet: LM Studio / Ollama (needs a llama.cpp port, on the roadmap), vLLM.
 
 Caveats, honestly: batch 1 only (prefill dequantizes into a buffer, no speedup there), and on HBM cards
 (A100, H100 SXM) the decoder is not yet fast enough to beat native; that is the next piece of work.
