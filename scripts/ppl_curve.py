@@ -1,4 +1,4 @@
-"""Perplexity with the llama.cpp method, so NWC / native / fp8 points can sit on one curve with GGUF models scored by
+"""Perplexity with the llama.cpp method, so NWC / native / fp8 numbers are comparable with GGUF models scored by
 `llama-perplexity` on the same text file: the text is tokenized once (no special tokens), cut into consecutive chunks
 of n_ctx tokens, and in every chunk the tokens of the second half are scored (logits at positions n_ctx/2 .. n_ctx-2
 predict tokens n_ctx/2+1 .. n_ctx-1), perplexity = exp(sum nll / count). Prefill path (dequantization + cuBLAS).
