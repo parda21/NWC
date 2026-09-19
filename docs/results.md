@@ -161,3 +161,24 @@ Tracked as [roadmap issues](https://github.com/parda21/NWC/issues?q=is%3Aissue+l
    ([#6](https://github.com/parda21/NWC/issues/6)).
 6. Prefill (batch > 1) dequantizes into a scratch buffer — no speed gain there.
 7. Turing (sm_75) builds without spills (56 registers) but has not been run ([#5](https://github.com/parda21/NWC/issues/5)).
+
+## 7. Lossless coding on top of quantized weights (measured, no kernel)
+
+`scripts/entropy_quant.py` quantizes the 253 linear matrices of Qwen3-4B (4.02 G weights) and measures the
+zero-order entropy of the quantized symbols, i.e. what an ideal memoryless coder would reach on top of each
+format. RTX 4070, per-matrix, weighted by size:
+
+| format | stored bits/weight | entropy bits/weight | ideal coder | v9 prefix code | 4B model |
+|---|---|---|---|---|---|
+| BF16 (NWC today) | 16.00 | 10.76 | 0.673 | 0.676 | 5.41 GB |
+| int8, per output channel | 8.01 | 6.97 | 0.871 | 2.55 (unusable) | 3.51 GB |
+| fp8 e4m3, per output channel | 8.01 | 6.57 | 0.820 | 1.03 (unusable) | 3.30 GB |
+| int4, groups of 128 | 4.12 | 3.35 | 0.812 | 1.08 (unusable) | 1.68 GB |
+
+Reading: on BF16 the rank prefix code is within 0.5 % of the entropy because the coded alphabet (128 exponents)
+is steep. Quantized alphabets are flat (int8: 256 symbols at ~7 bits), so the unary rank code is the wrong tool
+and a rANS/tANS-class coder is needed to collect the 13 % (int8), 18 % (fp8) or 19 % (int4). At the same time
+the decoder's time budget per weight shrinks by the same factor as the stored size (2× for int8/fp8, 4× for
+int4), because the uncompressed competitor is already that much faster than BF16. Consequence: on top of
+quantized formats NWC is a memory saving of 13–19 %, not a speed-up, until the decoder is several times faster
+than v9 (tensor-core path, [#3](https://github.com/parda21/NWC/issues/3)).
