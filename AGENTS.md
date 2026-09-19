@@ -78,6 +78,8 @@ output is pasted into the release notes.
   (docs/results.md, section 9). Knock things out and measure before believing an instruction count.
 - Out-of-bounds stores in a dequantization kernel corrupt *other* tensors and show up as wrong matvec results
   later; when an odd-shape test fails on several fronts at once, suspect a store guard first.
+- **A fresh `build/nwc_ops.dll` is shadowed by the wheel's `nwc/lib/nwc_ops.dll`** (search order: `NWC_DLL`, `nwc/lib`, `build`).
+  Test a local build with `NWC_DLL=build/nwc_ops.dll` (or `.so`), otherwise the tests run the released library.
 
 ## Definition of done
 

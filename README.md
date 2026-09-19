@@ -32,6 +32,9 @@ memory and the GPU reads fewer bytes per token.
 
 ## News
 
+- **main** · layout 2 (format v11, opt-in `layout=2`): fixed-width ranks with exception lists, a bandwidth-bound decoder for
+  GPUs where the prefix-code decoder is issue-bound; on the RTX 4070 it is slower than layout 0 by its size penalty, A16
+  and H100 still to be measured ([docs/results.md](docs/results.md), section 10).
 - **main** · `convert` also compresses untied embedding tables (lossless, gather kernel); `scripts/ppl_curve.py`
   measures perplexity with the llama.cpp method, so PyTorch and GGUF numbers are comparable.
 - **main** · tensor-core accumulation layout (format v10, opt-in `layout=1`): fp8 kernels on the A16 9–13 % faster, at parity on the 4070; v9 checkpoints keep loading ([docs/results.md](docs/results.md), section 9).

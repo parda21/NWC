@@ -12,7 +12,7 @@ from safetensors.torch import save_file, load_file
 from .nwc_torch import NWCWeight, NWCLinear, NWCEmbedding, _FusedHead, VERSION
 
 FORMAT = 1
-COMPATIBLE = {9, VERSION}          # v9 checkpoints (layout 0) load into the v10 library
+COMPATIBLE = {9, 10, VERSION}      # v9 / v10 checkpoints (layouts 0 and 1) load into the v11 library
 TENSOR_NAMES = ("data", "bases", "hdr", "lut", "low")
 
 

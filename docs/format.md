@@ -146,6 +146,33 @@ nl the 16-column chunks of the last column block; whole super-chunks are coded a
 kernel loads one super-chunk ahead. Dequantization writes bf16x2 pairs into the row-major output, guarded by
 column < `K16`. Measured effect: docs/results.md, section 9.
 
+## 4d. Layout 2: fixed-width ranks (format v11)
+
+Layout 2 keeps layout 1's blocks (16 rows × 512 columns), lane order (mma fragment order) and x fragments, but replaces
+the prefix code by fixed-width fields so the decoder needs no bit window, no lookup per pair and no refills:
+
+- **Nibble plane** `[super-chunk slot][lane][8 bytes]`: per weight one nibble `[sign | rank]` (nibble j of a lane's 16
+  weights in byte j >> 1, low nibble for even j). Rank 0..6 are the seven most frequent exponent symbols of the tensor
+  (BF16: the 7-bit exponent byte; fp8: the 4-bit exponent, with e = 0 split into subnormal groups); rank 7 marks an
+  exception.
+- **Raw plane** behind it: BF16 `[slot][lane][16 bytes]` (the low byte); fp8 `[super-chunk pair][word 0..2][lane][4 bytes]`,
+  32 three-bit mantissa fields per lane and pair, field t at bits 3t of the 96-bit little-endian integer.
+- **Exceptions** in `data`: per block at `bases[b]`, the lanes' entries one after the other, `hdr[b][lane]` = entries of
+  that lane (0..255; more makes the encoder return -3). Entry = (index in the lane's block stream, value): 3 bytes for
+  BF16 (the whole weight), 2 bytes for fp8 (the byte). The planes of an exception are zero, so it decodes to ±0 and the
+  correction `value · x[col]` is added after the block (per lane over its own entries, reduced over the quad).
+- **Table** (in the `lut` tensor): `lut[0..1]` = high byte of rank 0..7 (rank 7 = 0), `lut[2..3]` = bit 7 of the low byte
+  per rank (fp8: the exponent's low bit). The decoder keeps both in registers.
+
+Decoding four weights: `sel = nibbles & 0x7777` selects the high bytes with one PRMT from the 8-byte table, a second
+PRMT in sign-replication mode reads the sign bits out of `(nibbles, nibbles << 4)`, one LOP3 merges them; the low bytes
+come straight from the raw plane (fp8: a 12-bit slice of the mantissa words indexes a 4096-word shared-memory table
+that spreads four 3-bit fields to four bytes, plus the PRMT'd exponent bit); two PRMTs build the bf16x2 fragments. Per
+16 weights and lane that is one 8-byte, one 16-byte (fp8: 1.5 × 4-byte) and one 16-byte x load, no shared-memory
+lookups except the fp8 mantissa table, so the kernel is bandwidth-bound. Size: BF16 12 bits per weight (0.75) plus
+0.05 % exceptions × 3 bytes; fp8 7 bits (0.875) plus ~3 % exceptions × 2 bytes. Both are worse than layouts 0/1
+(0.69 and 0.87); the point is speed on GPUs where the variable-length decoder is issue-bound.
+
 ## 5. Library interface (`nwc_ops.dll` / `nwc_ops.so`)
 
 | export | purpose |
@@ -174,3 +201,4 @@ older libraries (v7/v8) for A/B comparisons via the `NWC_DLL` environment variab
 | 8 | rANS pairs, one 64-bit state, 32-bit renorm | 4096 | 32-bit table `[pair 16 \| freq 8 \| bias 8]`, escape side stream, persistent blocks with table and x in shared memory; A16 0.73–0.78× |
 | **9** | **prefix code + LUT** | **8 rows × 512 columns** | **A16 1.06–1.18×** |
 | **10** | as 9, plus fp8 element type and layout 1 (tensor-core fragment order, 16 × 512) | | fp8 on the A16 0.72× → 0.80× of native fp8 |
+| **11** | as 10, plus layout 2 (fixed-width ranks, exception lists) | 16 × 512 | bandwidth-bound decoder, section 4d |

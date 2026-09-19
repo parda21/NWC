@@ -269,3 +269,33 @@ Edge handling worth knowing: a 16-column chunk is not one mma (the super-chunk c
 so matrices whose `K16` is an odd multiple of 16 code whole super-chunks with fillers, and the dequantization and
 gather kernels guard their stores with `column < K16`; the first version wrote filler columns past the row end
 and corrupted neighbouring tensors.
+
+## 10. Layout 2: fixed-width ranks (format v11, opt-in `layout=2`)
+
+The variable-length decoder (layouts 0 and 1) is issue-bound on the A16 and at 91 % of the memory bandwidth on the
+RTX 4070. Layout 2 ([docs/format.md](format.md), section 4d) removes the variable-length part: a nibble `[sign | rank]`
+per weight, ranks 0..6 for the seven most frequent exponent symbols, rank 7 an exception with the value in a per-block
+list; the raw plane as before. Decoding four weights costs two PRMT lookups, one LOP3 and two PRMT fragment builds,
+no bit window, no refills, so the kernel reads at the memory bandwidth on every GPU. The price is size: BF16 12 bits
+per weight (0.75) plus exceptions, fp8 7 bits (0.875) plus exceptions.
+
+RTX 4070, `scripts/kernbench.py --layout 2` (Qwen3-4B shapes, GPU time per matvec, sum per token over 36 layers):
+
+| RTX 4070 | native | layout 0 | layout 2 |
+|---|---|---|---|
+| BF16, sum per token | cuBLAS 22.66 ms | **16.66 ms** (1.16–1.50× cuBLAS) | 19.33 ms (1.08–1.25× cuBLAS) |
+| BF16, lm_head read bandwidth / bytes per weight | 465 GB/s / 2 | 425 GB/s / 1.37 | 436 GB/s / 1.50 |
+| fp8, sum per token | reference fp8 14.63 ms | **15.02 ms** (0.91–1.05×) | 16.06 ms (0.82–1.09×) |
+| fp8, bits per weight (`o` projection, real weights) | 8 | 7.28 | 7.97 (5.7 % exceptions × 16 bits) |
+
+Both layouts read at the same bandwidth on the 4070, so the one with fewer bytes wins there: layout 2 is slower
+than layout 0 by exactly its size penalty. It can only pay off where layout 0 is issue-bound (A16, and presumably the
+H100 with its 3.35 TB/s), which is still to be measured. For fp8 the fixed-width code does not work on real matrices at
+all: the top-7 exponents cover only 94 % of a projection's weights (the estimate over the whole model was 96.7 %), and
+at 16 bits per exception the format lands at 7.97 bits per weight, the size of plain fp8. fp8 stays with layouts 0/1
+(0.87 of fp8); layout 2 is a BF16 option.
+
+Correctness: [tests/test_format_cpu.py](../tests/test_format_cpu.py) decodes layout 2 in plain Python (nibble plane,
+raw plane, exception lists), [tests/test_fp8.py](../tests/test_fp8.py) runs every layout, `NWC_LAYOUT=2` runs the
+matvec, gather and checkpoint tests on it. Pitfall met on the way: `scripts/kernbench.py` fed the reference fp8 matvec
+BF16 x for layouts ≥ 1 (its `max|dy|` column was garbage there, the timings were fine); fixed.

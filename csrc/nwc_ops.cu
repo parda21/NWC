@@ -45,7 +45,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-#define VERSION    10                   /* 9 = layout 0 only; 10 = layout 1 (tensor-core fragment order) added */
+#define VERSION    11                   /* 9 = layout 0 only; 10 = layout 1 (tensor-core fragment order); 11 = layout 2 (fixed-width ranks) */
 #define LANES      32u
 #define ROWS       8u
 #define COLS       512u
@@ -62,12 +62,18 @@
 /* the elem parameter carries the element type in bits 0..3 and the layout in bits 4..7:
    layout 0: 8 rows x 512 columns, lane = 16 consecutive columns of a row, FFMA accumulation (format v9)
    layout 1: 16 rows x 512 columns, lane stream in mma.m16n8k16 A-fragment order, tensor-core accumulation
-             (sm_80+; FFMA fallback in the same order on sm_75), raw plane [row group][chunk][lane][8 | 4 bytes] */
+             (sm_80+; FFMA fallback in the same order on sm_75), raw plane [row group][chunk][lane][8 | 4 bytes]
+   layout 2: layout 1's blocks and order with fixed-width codes (nibble [sign | rank], exception lists), see MAXR2 */
 #define TYPE_OF(e)   ((e) & 15)
 #define LAYOUT_OF(e) (((e) >> 4) & 15)
 #define ROWS1      16u
 #define CHUNKS1    32u                  /* 16-column chunks per block (512 columns) */
 #define SCH1       16u                  /* 32-column super-chunks per block */
+/* layout 2: same 16 x 512 blocks and fragment order as layout 1, but fixed-width codes: per weight a nibble [sign | rank]
+   (rank 0..6 = the 7 most frequent exponent symbols of the tensor, 7 = exception) plus the raw plane (BF16: the low byte;
+   FP8: a 3-bit mantissa field), exceptions per block and lane as (index, value) entries in `data` (hdr = count per lane).
+   No variable-length decoding: PRMT translates 4 ranks at once, the decoder is bandwidth-bound. */
+#define MAXR2      7u
 #define FLAG       (1u << 30)
 #define TBP        1024u                 /* threads per persistent block */
 #define NPAIR      1024u                 /* size of freq/psym (Python bridge, compatible with v8) */
@@ -79,7 +85,7 @@
 
 /* Rounded-up dimensions of an M x K matrix (identical on host and device) */
 struct Shape {
-    uint32_t M, K, K16, Kp, CB, Mp, nb, rows, nl, nsl, spr;
+    uint32_t M, K, K16, Kp, CB, Mp, nb, rows, nl, nsl, spr, nsl2, spr2;
     __host__ __device__ Shape(uint32_t M_, uint32_t K_, int layout = 0) : M(M_), K(K_) {
         rows = layout ? ROWS1 : ROWS;
         K16 = (K + 15u) & ~15u; Kp = (K + COLS - 1) / COLS * COLS; CB = Kp / COLS; Mp = (M + rows - 1) / rows * rows;
@@ -87,18 +93,28 @@ struct Shape {
         nl = (K16 - (CB - 1) * COLS) / 16;                       /* layout 1: coded 16-column chunks in the last column block */
         nsl = (nl + 1) / 2;                                       /* layout 1: 32-column super-chunks there */
         spr = SCH1 * (CB - 1) + nsl;                              /* layout 1: super-chunk slots per row group (raw plane) */
+        nsl2 = (nsl + 1) / 2; spr2 = (SCH1 / 2) * (CB - 1) + nsl2;   /* layout 2 fp8: super-chunk pairs per row group */
     }
 };
 
 EXPORT int nwc_info(int what) {
     switch (what) { case 0: return VERSION; case 1: return 1; case 2: return (int)TAB_WORDS; case 3: return (int)HDR_BLOCK;
                     case 4: return (int)BLOCK; case 5: return 1; /* elem parameter (0 BF16, 1 FP8) on all entry points */
-                    case 6: return 1; /* layout 1 (tensor-core fragment order) supported: elem |= 16 */ }
+                    case 6: return 1; /* layout 1 (tensor-core fragment order) supported: elem |= 16 */
+                    case 7: return 1; /* layout 2 (fixed-width ranks, exception lists) supported: elem |= 32 */ }
     return -1;
 }
 /* bytes of the raw plane: BF16 one mantissa byte per weight, FP8 one nibble (row stride K16/2 bytes) */
+/* layout 2 planes inside `low`: nibble plane [slot][lane][8 B] first, then the raw plane (BF16 [slot][lane][16 B],
+   FP8 [super-chunk pair][word 0..2][lane][4 B]: 32 three-bit fields per lane and pair, field t at bits 3t of the 96-bit
+   little-endian integer) */
+__host__ __device__ static inline uint64_t nib_bytes2(const Shape &f) { return (uint64_t)(f.Mp / ROWS1) * f.spr * LANES * 8u; }
+__host__ __device__ static inline uint64_t raw_bytes2(const Shape &f, int t) {
+    return t == ELEM_FP8 ? (uint64_t)(f.Mp / ROWS1) * f.spr2 * 3u * LANES * 4u : (uint64_t)(f.Mp / ROWS1) * f.spr * LANES * 16u;
+}
 static uint64_t raw_bytes(const Shape &f, int elem) {
     const int t = TYPE_OF(elem);
+    if (LAYOUT_OF(elem) == 2) return nib_bytes2(f) + raw_bytes2(f, t);
     if (LAYOUT_OF(elem)) return (uint64_t)(f.Mp / ROWS1) * f.spr * LANES * (t == ELEM_FP8 ? 8u : 16u);
     return t == ELEM_FP8 ? (uint64_t)f.M * (f.K16 / 2) : (uint64_t)f.M * f.K16;
 }
@@ -143,11 +159,95 @@ static inline uint32_t nib_high(uint32_t j) { return (j >> 2) & 1u; }
 static inline uint32_t frag_row(uint32_t L, uint32_t i) { return (L >> 2) + 8u * ((i >> 1) & 1u); }
 static inline uint32_t frag_col(uint32_t L, uint32_t i) { return 8u * (L & 3u) + 4u * ((i >> 3) & 1u) + 2u * ((i >> 2) & 1u) + (i & 1u); }
 
+/* layout 2 FP8 symbols: normals e = 1..15 -> symbol e (3-bit field = mantissa), subnormals m >= 4 -> 16 (field (m-4) << 1),
+   m = 2, 3 -> 17 (field (m-2) << 2), m = 1 -> 18, zero -> 19. Per symbol the BF16 high byte without sign (hb) and the
+   low byte's bit 7 (lb); the low byte is lb | field << 4. Same values as fp8_split, regrouped so the exponent is one symbol. */
+static int fp8_split2(uint8_t b, uint8_t *sym, uint8_t *m3) {
+    uint32_t e = (b >> 3) & 15u, m = b & 7u;
+    if (e >= 1) { if (e == 15 && m == 7) return -1; *sym = (uint8_t)e; *m3 = (uint8_t)m; return 0; }
+    if (m >= 4) { *sym = 16; *m3 = (uint8_t)((m - 4) << 1); return 0; }
+    if (m >= 2) { *sym = 17; *m3 = (uint8_t)((m - 2) << 2); return 0; }
+    *sym = (m == 1) ? 18 : 19; *m3 = 0; return 0;
+}
+static uint8_t fp8_hb2(int sym) { static const uint8_t t[20] = {0,60,61,61,62,62,63,63,64,64,65,65,66,66,67,67,60,59,59,0}; return t[sym]; }
+static uint8_t fp8_lb2(int sym) { return (sym >= 1 && sym <= 15) ? (uint8_t)((sym & 1) << 7) : (uint8_t)(sym == 17 ? 0x80 : 0); }
+
+static int64_t encode2(const void *wv, uint64_t n, uint32_t K, int elem, uint16_t *psym, uint32_t *bases, uint8_t *hdr,
+                       uint8_t *data, uint64_t data_cap, uint8_t *low)
+{
+    Shape f((uint32_t)(n / K), K, 2);
+    const int NSYM = elem == ELEM_FP8 ? 20 : 128, ES = elem == ELEM_FP8 ? 2 : 3;   /* exception entry: index + fp8 byte | BF16 */
+    uint8_t *high = (uint8_t*)malloc(n), *raw = (uint8_t*)malloc(n);             /* symbol (bit 7 = sign), raw byte / 3-bit field */
+    if (elem == ELEM_FP8) {
+        const uint8_t *w = (const uint8_t*)wv;
+        for (uint64_t i = 0; i < n; i++) {
+            uint8_t sym, m3;
+            if (fp8_split2(w[i], &sym, &m3)) { free(high); free(raw); return -2; }
+            high[i] = (uint8_t)((w[i] & 0x80u) | sym); raw[i] = m3;
+        }
+    } else {
+        const uint16_t *w = (const uint16_t*)wv;
+        for (uint64_t i = 0; i < n; i++) { high[i] = (uint8_t)(w[i] >> 8); raw[i] = (uint8_t)w[i]; }
+    }
+    uint64_t hist[128] = {0}; for (uint64_t i = 0; i < n; i++) hist[high[i] & 0x7F]++;
+    int ord[128]; for (int i = 0; i < 128; i++) ord[i] = i;
+    for (int a = 0; a < NSYM; a++) for (int b = a + 1; b < NSYM; b++) if (hist[ord[b]] > hist[ord[a]]) { int t = ord[a]; ord[a] = ord[b]; ord[b] = t; }
+    uint8_t rank_of_sym[128]; for (int r = 0; r < 128; r++) rank_of_sym[ord[r]] = (uint8_t)(r < (int)MAXR2 ? r : MAXR2);
+    for (uint32_t i = 0; i < NPAIR; i++) psym[i] = 0;
+    for (int r = 0; r < (int)MAXR2; r++) {                                       /* psym[r] = hb of rank r, psym[8 + r] = lb bit 7 */
+        psym[r] = (uint16_t)(elem == ELEM_FP8 ? fp8_hb2(ord[r]) : ord[r]);
+        psym[8 + r] = (uint16_t)(elem == ELEM_FP8 ? fp8_lb2(ord[r]) : 0);
+    }
+    memset(low, 0, nib_bytes2(f) + raw_bytes2(f, elem));
+    uint8_t *nib = low, *rawp = low + nib_bytes2(f);
+    uint64_t pos = 0; int64_t rc = -1;
+    for (uint32_t b = 0; b < f.nb; b++) {
+        const uint32_t rb = b / f.CB, cb = b % f.CB;
+        const uint32_t nchunk = (cb == f.CB - 1) ? f.nl : CHUNKS1, nsc = (nchunk + 1) / 2, slot0 = rb * f.spr + cb * SCH1;
+        pos = (pos + ALIGN - 1) / ALIGN * ALIGN;
+        bases[b] = (uint32_t)pos;
+        for (uint32_t L = 0; L < LANES; L++) {
+            uint32_t cnt = 0;
+            for (uint32_t i = 0; i < nsc * 16; i++) {
+                const uint32_t sc = i >> 4, j = i & 15;
+                const uint32_t row = rb * ROWS1 + frag_row(L, j), col = cb * COLS + sc * 32 + frag_col(L, j);
+                if (row >= f.M || col >= f.K) continue;                                /* filler: nibble 0 (rank 0, +), raw 0 */
+                const uint64_t wi = (uint64_t)row * K + col;
+                const uint32_t s = high[wi] >> 7, r = rank_of_sym[high[wi] & 0x7F];
+                uint8_t v = raw[wi], nb = (uint8_t)((s << 3) | r);
+                if (r == MAXR2) {                                                        /* exception: value in the entry, planes 0 */
+                    if (cnt == 255) { rc = -3; goto done; }
+                    if (pos + (uint64_t)cnt * ES + ES + 64 > data_cap) { rc = -1; goto done; }
+                    uint8_t *e = data + pos + (uint64_t)cnt * ES;
+                    e[0] = (uint8_t)i;
+                    if (elem == ELEM_FP8) e[1] = ((const uint8_t*)wv)[wi];
+                    else { const uint16_t w = ((const uint16_t*)wv)[wi]; e[1] = (uint8_t)w; e[2] = (uint8_t)(w >> 8); }
+                    v = 0; cnt++;
+                }
+                nib[((uint64_t)(slot0 + sc) * LANES + L) * 8 + (j >> 1)] |= (uint8_t)(nb << (4 * (j & 1)));
+                if (elem == ELEM_FP8) {
+                    const uint32_t t = 16 * (sc & 1) + j, bit = 3 * t, k = bit >> 5, sh = bit & 31;
+                    const uint64_t pair = (uint64_t)rb * f.spr2 + cb * (SCH1 / 2) + (sc >> 1);
+                    uint8_t *w0 = rawp + ((pair * 3 + k) * LANES + L) * 4;
+                    uint32_t x; memcpy(&x, w0, 4); x |= (uint32_t)v << sh; memcpy(w0, &x, 4);
+                    if (sh > 29) { uint8_t *w1 = w0 + LANES * 4; memcpy(&x, w1, 4); x |= (uint32_t)v >> (32 - sh); memcpy(w1, &x, 4); }
+                } else rawp[((uint64_t)(slot0 + sc) * LANES + L) * 16 + j] = v;
+            }
+            hdr[(uint64_t)b * HDR_BLOCK + L] = (uint8_t)cnt; pos += (uint64_t)cnt * ES;
+        }
+    }
+    rc = (int64_t)((pos + ALIGN - 1) / ALIGN * ALIGN + 64);
+done:
+    free(high); free(raw);
+    return rc;
+}
+
 EXPORT int64_t nwc_encode(const void *wv, uint64_t n, uint32_t K, int elem_code, uint16_t *freq, uint16_t *psym,
                           uint32_t *bases, uint8_t *hdr, uint8_t *data, uint64_t data_cap, uint8_t *low)
 {
     if (K == 0 || n % K || n / K > 0xFFFFFFFFull) return -1;
     const int elem = TYPE_OF(elem_code), layout = LAYOUT_OF(elem_code);
+    if (layout == 2) { for (uint32_t i = 0; i < NPAIR; i++) freq[i] = 0; return encode2(wv, n, K, elem, psym, bases, hdr, data, data_cap, low); }
     Shape f((uint32_t)(n / K), K, layout);
     const int NSYM = elem == ELEM_FP8 ? 10 : 128, MR = elem == ELEM_FP8 ? (int)MAXR_FP8 : (int)MAXR;
     uint8_t *high = (uint8_t*)malloc(n);                                   /* per weight: symbol (bit 7 = sign) */
@@ -223,6 +323,11 @@ static uint32_t clz32(uint32_t x) { uint32_t u = 0; if (!x) return 32; while (!(
 /* LUT: for every 12-bit pattern the first <= 2 complete codes */
 EXPORT void nwc_build_tab(const uint16_t *freq, const uint16_t *psym, int elem, uint32_t *lut) {
     (void)freq;
+    if (LAYOUT_OF(elem) == 2) {                       /* lut[0..1] = hb of rank 0..7 (rank 7 = 0), lut[2..3] = low byte's bit 7 (fp8) */
+        memset(lut, 0, 4 * LUTN);
+        for (int r = 0; r < 8; r++) { lut[r >> 2] |= (uint32_t)(psym[r] & 0xFFu) << (8 * (r & 3)); lut[2 + (r >> 2)] |= (uint32_t)(psym[8 + r] & 0xFFu) << (8 * (r & 3)); }
+        return;
+    }
     const uint32_t MR = TYPE_OF(elem) == ELEM_FP8 ? MAXR_FP8 : MAXR;
     for (uint32_t pat = 0; pat < LUTN; pat++) {
         uint32_t bits = pat << (32 - PEEK), pos = 0, n = 0, c1 = 0, by[2] = {0, 0};
@@ -723,6 +828,219 @@ kern_ref_fp8(const uint8_t *__restrict__ w, const float *__restrict__ scale, con
     }
 }
 
+/* ============================ Layout 2: fixed-width ranks ============================ */
+__device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
+    uint32_t r; asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel)); return r;
+}
+/* bits 12G .. 12G+11 of the 96-bit integer (w2:w1:w0) via a funnel shift (G is a compile-time constant after unrolling) */
+__device__ __forceinline__ uint32_t bits12(uint32_t w0, uint32_t w1, uint32_t w2, int G) {
+    const int bit = 12 * G, k = bit >> 5, sh = bit & 31;
+    const uint32_t lo = (k == 0) ? w0 : (k == 1) ? w1 : w2, hi = (k == 0) ? w1 : (k == 1) ? w2 : 0u;
+    uint32_t v; asm("shf.r.wrap.b32 %0, %1, %2, %3;" : "=r"(v) : "r"(lo), "r"(hi), "r"(sh));
+    return v & 0xFFFu;
+}
+/* fp8: 12-bit index (four 3-bit fields) -> four raw bytes (field << 4), shared-memory table of 4096 words */
+__device__ __forceinline__ uint32_t mant_expand(uint32_t i) {
+    return ((i & 7u) << 4) | (((i >> 3) & 7u) << 12) | (((i >> 6) & 7u) << 20) | (((i >> 9) & 7u) << 28);
+}
+struct Tab2 { uint32_t T0, T1, U0, U1; };            /* hb of rank 0..7 (bytes), low-byte bit 7 of rank 0..7 (fp8) */
+__device__ __forceinline__ Tab2 load_tab2(const uint32_t *__restrict__ lut) {
+    Tab2 t; t.T0 = __ldg(lut); t.T1 = __ldg(lut + 1); t.U0 = __ldg(lut + 2); t.U1 = __ldg(lut + 3); return t;
+}
+/* four weights (group `half` of the nibble word nw: nibbles 4*half .. 4*half+3) -> two bf16x2 fragment registers
+   a_lo = weights 0,1 and a_hi = weights 2,3. hb: PRMT table lookup with the rank nibbles as selectors; sign: PRMT in
+   sign-replication mode reads the nibbles' bit 3 out of (nw, nw << 4); low byte: raw4 (BF16 bytes | fp8 mantissa << 4)
+   plus the fp8 exponent's low bit from the second table. */
+template<int ELEM>
+__device__ __forceinline__ void dec2_group(const Tab2 &t, uint32_t nw, int half, uint32_t raw4, uint32_t &a_lo, uint32_t &a_hi) {
+    const uint32_t sel = (half ? (nw >> 16) : nw) & 0x7777u;
+    uint32_t hb = prmt(t.T0, t.T1, sel);
+    const uint32_t srep = prmt(nw, nw << 4, half ? 0xBFAEu : 0x9D8Cu);
+    hb |= srep & 0x80808080u;
+    uint32_t lb = raw4;
+    if (ELEM == ELEM_FP8) lb |= prmt(t.U0, t.U1, sel);
+    a_lo = prmt(lb, hb, 0x5140u); a_hi = prmt(lb, hb, 0x7362u);
+}
+__device__ __forceinline__ uint32_t dfrag_col(uint32_t lane, uint32_t j) { return 8u * (lane & 3u) + 4u * ((j >> 3) & 1u) + 2u * ((j >> 2) & 1u) + (j & 1u); }
+/* exception value as fp32: BF16 entry (index, lo, hi) or fp8 entry (index, byte) */
+template<int ELEM>
+__device__ __forceinline__ float exc_value(const uint8_t *e) {
+    if (ELEM == ELEM_FP8) return fp8_to_f32(e[1]);
+    return __uint_as_float(((uint32_t)e[1] | ((uint32_t)e[2] << 8)) << 16);
+}
+/* start of this lane's exception entries in a block (warp prefix sum over hdr) and its count */
+__device__ __forceinline__ const uint8_t *exc_start(const uint8_t *__restrict__ data, const uint32_t *__restrict__ bases,
+                                                    const uint8_t *__restrict__ hdr, uint32_t b, uint32_t lane, int ES, uint32_t &cnt) {
+    cnt = __ldg(hdr + (uint64_t)b * HDR_BLOCK + lane);
+    uint32_t xx = cnt;
+    #pragma unroll
+    for (int o = 1; o < 32; o <<= 1) { uint32_t y = __shfl_up_sync(0xffffffffu, xx, o); if (lane >= (uint32_t)o) xx += y; }
+    return data + __ldg(bases + b) + (uint64_t)(xx - cnt) * ES;
+}
+
+/* Block kernel, layout 2: per lane and super-chunk one 8-byte nibble load, one 16-byte (BF16) or 1.5 x 4-byte (fp8) raw
+   load and one 16-byte x load; the mma / FFMA part is layout 1's. Exceptions are added after the block's super-chunks
+   (their planes decode to +-0), per lane over its own entries, reduced over the quad. */
+template<int MODE, int ELEM>
+__global__ void __launch_bounds__(TBP, 1)
+kern_block2(const uint8_t *__restrict__ data, const uint32_t *__restrict__ bases, const uint8_t *__restrict__ hdr,
+            const uint32_t *__restrict__ lut, const uint8_t *__restrict__ low, const float *__restrict__ x,
+            float *__restrict__ partial, uint16_t *__restrict__ out, uint32_t M, uint32_t K)
+{
+    extern __shared__ uint32_t smem[];
+    if (ELEM == ELEM_FP8) { for (uint32_t i = threadIdx.x; i < LUTN; i += TBP) smem[i] = mant_expand(i); __syncthreads(); }
+    const Tab2 tab = load_tab2(lut);
+    const uint32_t lane = threadIdx.x & 31, r = lane >> 2, q = lane & 3;
+    const Shape f(M, K, 2);
+    constexpr int ES = ELEM == ELEM_FP8 ? 2 : 3;
+    const uint8_t *rplane = low + nib_bytes2(f);
+
+    for (uint32_t b = blockIdx.x * (TBP / 32) + (threadIdx.x >> 5); b < f.nb; b += gridDim.x * (TBP / 32)) {
+        const uint32_t rb = b / f.CB, cb = b - rb * f.CB, row0 = rb * ROWS1, k0 = cb * COLS + 8 * q;
+        const uint32_t nchunk = (cb == f.CB - 1) ? f.nl : CHUNKS1, nsc = (nchunk + 1) / 2, slot0 = rb * f.spr + cb * SCH1;
+        const uint8_t *np = low + ((uint64_t)slot0 * LANES + lane) * 8;
+        const uint8_t *rp = (ELEM == ELEM_FP8) ? rplane + (((uint64_t)rb * f.spr2 + cb * (SCH1 / 2)) * 3 * LANES + lane) * 4
+                                               : rplane + ((uint64_t)slot0 * LANES + lane) * 16;
+        float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+        uint2 nn = __ldcs((const uint2*)np);
+        uint4 rr; uint32_t p0 = 0, p1 = 0, p2 = 0;
+        if (ELEM == ELEM_FP8) { p0 = __ldcs((const uint32_t*)rp); p1 = __ldcs((const uint32_t*)(rp + LANES * 4)); p2 = __ldcs((const uint32_t*)(rp + 2 * LANES * 4)); }
+        else rr = __ldcs((const uint4*)rp);
+        uint32_t c0 = 0, c1 = 0, c2 = 0;                                   /* fp8: the current pair's words */
+        #pragma unroll 1
+        for (uint32_t sc = 0; sc < nsc; sc++) {
+            const uint2 nw = nn; np += LANES * 8; nn = __ldcs((const uint2*)np);
+            uint4 cw;
+            if (ELEM == ELEM_FP8) {
+                if ((sc & 1) == 0) {
+                    c0 = p0; c1 = p1; c2 = p2; rp += 3 * LANES * 4;
+                    p0 = __ldcs((const uint32_t*)rp); p1 = __ldcs((const uint32_t*)(rp + LANES * 4)); p2 = __ldcs((const uint32_t*)(rp + 2 * LANES * 4));
+                }
+            } else { cw = rr; rp += LANES * 16; rr = __ldcs((const uint4*)rp); }
+            const uint32_t kc = k0 + sc * 32;
+            uint4 xb4;
+            if (MODE == 0) xb4 = __ldg((const uint4*)((const uint16_t*)x + kc));
+            else if (MODE == 2) {
+                const float4 xa = __ldg((const float4*)(x + kc)), xc = __ldg((const float4*)(x + kc + 4));
+                xb4 = make_uint4(pack_bf16x2(xa.y, xa.x), pack_bf16x2(xa.w, xa.z), pack_bf16x2(xc.y, xc.x), pack_bf16x2(xc.w, xc.z));
+            }
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const uint32_t nword = h ? nw.y : nw.x;
+                uint32_t r0, r1;                                                /* raw words of groups 2h, 2h+1 */
+                if (ELEM == ELEM_FP8) {
+                    const int G = 4 * (int)(sc & 1) + 2 * h;
+                    r0 = smem[bits12(c0, c1, c2, G)]; r1 = smem[bits12(c0, c1, c2, G + 1)];
+                } else { r0 = h ? cw.z : cw.x; r1 = h ? cw.w : cw.y; }
+                uint32_t a0, a1, a2, a3;
+                dec2_group<ELEM>(tab, nword, 0, r0, a0, a1);
+                dec2_group<ELEM>(tab, nword, 1, r1, a2, a3);
+                if (MODE == 1) {
+                    uint16_t *o = out + (uint64_t)row0 * f.K16 + kc + 4 * h;
+                    if (kc + 4 * h >= f.K16) continue;
+                    if (row0 + r < f.M)     { *(uint32_t*)(o + (uint64_t)r * f.K16) = a0; *(uint32_t*)(o + (uint64_t)r * f.K16 + 2) = a2; }
+                    if (row0 + r + 8 < f.M) { *(uint32_t*)(o + (uint64_t)(r + 8) * f.K16) = a1; *(uint32_t*)(o + (uint64_t)(r + 8) * f.K16 + 2) = a3; }
+                } else {
+                    const uint32_t b0 = h ? xb4.z : xb4.x, b1 = h ? xb4.w : xb4.y;
+#if __CUDA_ARCH__ >= 800
+                    mma_bf16(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+#else
+                    const float x0 = __uint_as_float(b0 << 16), x1 = __uint_as_float(b0 & 0xFFFF0000u), x2 = __uint_as_float(b1 << 16), x3 = __uint_as_float(b1 & 0xFFFF0000u);
+                    d0 = fmaf(__uint_as_float(a0 << 16), x0, d0); d0 = fmaf(__uint_as_float(a0 & 0xFFFF0000u), x1, d0);
+                    d2 = fmaf(__uint_as_float(a1 << 16), x0, d2); d2 = fmaf(__uint_as_float(a1 & 0xFFFF0000u), x1, d2);
+                    d0 = fmaf(__uint_as_float(a2 << 16), x2, d0); d0 = fmaf(__uint_as_float(a2 & 0xFFFF0000u), x3, d0);
+                    d2 = fmaf(__uint_as_float(a3 << 16), x2, d2); d2 = fmaf(__uint_as_float(a3 & 0xFFFF0000u), x3, d2);
+#endif
+                }
+            }
+        }
+        /* exceptions of this lane */
+        uint32_t cnt; const uint8_t *ep = exc_start(data, bases, hdr, b, lane, ES, cnt);
+        float e0 = 0.f, e8 = 0.f;
+        for (uint32_t k = 0; k < cnt; k++, ep += ES) {
+            const uint32_t i = ep[0], j = i & 15, col = cb * COLS + (i >> 4) * 32 + dfrag_col(lane, j), hi = (j >> 1) & 1u;
+            const float w = exc_value<ELEM>(ep);
+            if (MODE == 1) { out[(uint64_t)(row0 + r + 8 * hi) * f.K16 + col] = (uint16_t)bf16_bits(w); continue; }
+            const float xv = (MODE == 0) ? __uint_as_float((uint32_t)((const uint16_t*)x)[col] << 16) : __ldg(x + col);
+            if (hi) e8 = fmaf(w, xv, e8); else e0 = fmaf(w, xv, e0);
+        }
+        if (MODE != 1) {
+#if __CUDA_ARCH__ < 800
+            d0 += __shfl_xor_sync(0xffffffffu, d0, 1); d0 += __shfl_xor_sync(0xffffffffu, d0, 2);
+            d2 += __shfl_xor_sync(0xffffffffu, d2, 1); d2 += __shfl_xor_sync(0xffffffffu, d2, 2);
+#endif
+            e0 += __shfl_xor_sync(0xffffffffu, e0, 1); e0 += __shfl_xor_sync(0xffffffffu, e0, 2);
+            e8 += __shfl_xor_sync(0xffffffffu, e8, 1); e8 += __shfl_xor_sync(0xffffffffu, e8, 2);
+            d0 += e0; d2 += e8; (void)d1; (void)d3;
+            if (q == 0) {
+                if (MODE == 0) { partial[(uint64_t)(row0 + r) * f.CB + cb] = d0; partial[(uint64_t)(row0 + r + 8) * f.CB + cb] = d2; }
+                else { if (row0 + r < f.M) atomicAdd(partial + row0 + r, d0); if (row0 + r + 8 < f.M) atomicAdd(partial + row0 + r + 8, d2); }
+            }
+        }
+    }
+}
+
+/* Row gather, layout 2: one warp per requested row; all lanes decode the row group's super-chunks, the row's quad
+   writes its eight columns (two 8-byte stores, guarded at the right edge), then patches its exceptions */
+template<int ELEM>
+__global__ void __launch_bounds__(128)
+kern_gather2(const uint8_t *__restrict__ data, const uint32_t *__restrict__ bases, const uint8_t *__restrict__ hdr,
+             const uint32_t *__restrict__ lut, const uint8_t *__restrict__ low, const int64_t *__restrict__ ids,
+             uint32_t n_ids, uint16_t *__restrict__ out, uint32_t M, uint32_t K)
+{
+    __shared__ uint32_t smem[LUTN];
+    if (ELEM == ELEM_FP8) { for (uint32_t i = threadIdx.x; i < LUTN; i += blockDim.x) smem[i] = mant_expand(i); __syncthreads(); }
+    const Tab2 tab = load_tab2(lut);
+    uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31, r = lane >> 2, q = lane & 3;
+    if (warp >= n_ids) return;
+    int64_t R = ids[warp];
+    if (R < 0 || R >= (int64_t)M) return;
+    const Shape f(M, K, 2);
+    constexpr int ES = ELEM == ELEM_FP8 ? 2 : 3;
+    const uint8_t *rplane = low + nib_bytes2(f);
+    const uint32_t rb = (uint32_t)R / ROWS1, rr = (uint32_t)R % ROWS1;
+    const bool mine = (rr & 7u) == r, hi = rr >= 8;
+    uint16_t *o = out + (uint64_t)warp * f.K16;
+    for (uint32_t cb = 0; cb < f.CB; cb++) {
+        const uint32_t nchunk = (cb == f.CB - 1) ? f.nl : CHUNKS1, nsc = (nchunk + 1) / 2, slot0 = rb * f.spr + cb * SCH1;
+        const uint8_t *np = low + ((uint64_t)slot0 * LANES + lane) * 8;
+        const uint8_t *rp = (ELEM == ELEM_FP8) ? rplane + (((uint64_t)rb * f.spr2 + cb * (SCH1 / 2)) * 3 * LANES + lane) * 4
+                                               : rplane + ((uint64_t)slot0 * LANES + lane) * 16;
+        for (uint32_t sc = 0; sc < nsc; sc++) {
+            const uint2 nw = __ldcs((const uint2*)(np + (uint64_t)sc * LANES * 8));
+            uint4 cw; uint32_t c0 = 0, c1 = 0, c2 = 0;
+            if (ELEM == ELEM_FP8) {
+                const uint8_t *pp = rp + (uint64_t)(sc >> 1) * 3 * LANES * 4;
+                c0 = __ldcs((const uint32_t*)pp); c1 = __ldcs((const uint32_t*)(pp + LANES * 4)); c2 = __ldcs((const uint32_t*)(pp + 2 * LANES * 4));
+            } else cw = __ldcs((const uint4*)(rp + (uint64_t)sc * LANES * 16));
+            uint32_t v[4];
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const uint32_t nword = h ? nw.y : nw.x;
+                uint32_t r0, r1;
+                if (ELEM == ELEM_FP8) { const int G = 4 * (int)(sc & 1) + 2 * h; r0 = smem[bits12(c0, c1, c2, G)]; r1 = smem[bits12(c0, c1, c2, G + 1)]; }
+                else { r0 = h ? cw.z : cw.x; r1 = h ? cw.w : cw.y; }
+                uint32_t a0, a1, a2, a3;
+                dec2_group<ELEM>(tab, nword, 0, r0, a0, a1);
+                dec2_group<ELEM>(tab, nword, 1, r1, a2, a3);
+                v[2 * h] = hi ? a1 : a0; v[2 * h + 1] = hi ? a3 : a2;       /* columns 8q + 4h + 0..3 */
+            }
+            const uint32_t kc = cb * COLS + sc * 32 + 8 * q;
+            if (mine) {
+                if (kc < f.K16)     *(uint2*)(o + kc) = make_uint2(v[0], v[1]);
+                if (kc + 4 < f.K16) *(uint2*)(o + kc + 4) = make_uint2(v[2], v[3]);
+            }
+        }
+        uint32_t cnt; const uint8_t *ep = exc_start(data, bases, hdr, rb * f.CB + cb, lane, ES, cnt);
+        if (mine)
+            for (uint32_t k = 0; k < cnt; k++, ep += ES) {
+                const uint32_t i = ep[0], j = i & 15;
+                if ((((j >> 1) & 1u) != 0) != hi) continue;
+                o[cb * COLS + (i >> 4) * 32 + dfrag_col(lane, j)] = (uint16_t)bf16_bits(exc_value<ELEM>(ep));
+            }
+    }
+}
+
 /* ============================ Host: launchers ============================ */
 static int g_sms = 0;
 EXPORT int nwc_setup(void);
@@ -741,6 +1059,11 @@ static void launch_mode1(int bl, cudaStream_t st, const uint8_t *data, const uin
                          const uint32_t *tab, const uint8_t *low, const float *x, float *partial, uint16_t *out, const Shape &f) {
     kern_block1<MODE, ELEM><<<bl, TBP, SMEM, st>>>(data, bases, hdr, tab, low, x, partial, out, f.M, f.K, SH);
 }
+template<int MODE, int ELEM>
+static void launch_mode2(int bl, cudaStream_t st, const uint8_t *data, const uint32_t *bases, const uint8_t *hdr,
+                         const uint32_t *tab, const uint8_t *low, const float *x, float *partial, uint16_t *out, const Shape &f) {
+    kern_block2<MODE, ELEM><<<bl, TBP, SMEM, st>>>(data, bases, hdr, tab, low, x, partial, out, f.M, f.K);
+}
 static int launch_block(int mode, int elem_code, cudaStream_t st, const uint8_t *data, const uint32_t *bases, const uint8_t *hdr,
                         const uint32_t *tab, const uint8_t *low, const float *x, float *partial, uint16_t *out, uint64_t n, uint32_t K)
 {
@@ -748,6 +1071,18 @@ static int launch_block(int mode, int elem_code, cudaStream_t st, const uint8_t 
     const int elem = TYPE_OF(elem_code), layout = LAYOUT_OF(elem_code);
     Shape f((uint32_t)(n / K), K, layout);
     int bl = (int)((f.nb + TBP / 32 - 1) / (TBP / 32)); if (bl > g_sms) bl = g_sms;
+    if (layout == 2) {
+        if (elem == ELEM_FP8) {
+            if (mode == 0)      launch_mode2<0, ELEM_FP8>(bl, st, data, bases, hdr, tab, low, x, partial, out, f);
+            else if (mode == 1) launch_mode2<1, ELEM_FP8>(bl, st, data, bases, hdr, tab, low, x, partial, out, f);
+            else                launch_mode2<2, ELEM_FP8>(bl, st, data, bases, hdr, tab, low, x, partial, out, f);
+        } else {
+            if (mode == 0)      launch_mode2<0, ELEM_BF16>(bl, st, data, bases, hdr, tab, low, x, partial, out, f);
+            else if (mode == 1) launch_mode2<1, ELEM_BF16>(bl, st, data, bases, hdr, tab, low, x, partial, out, f);
+            else                launch_mode2<2, ELEM_BF16>(bl, st, data, bases, hdr, tab, low, x, partial, out, f);
+        }
+        return (int)cudaGetLastError();
+    }
     if (layout) {
         if (elem == ELEM_FP8) {
             if (mode == 0)      launch_mode1<0, ELEM_FP8>(bl, st, data, bases, hdr, tab, low, x, partial, out, f);
@@ -813,7 +1148,10 @@ EXPORT int nwc_gather(void *stream, const uint8_t *data, const uint32_t *bases, 
     if (n_ids == 0) return 0;
     cudaStream_t st = (cudaStream_t)stream;
     const unsigned gb = (n_ids * 32 + 127) / 128; const uint32_t Mr = (uint32_t)(n / K);
-    if (LAYOUT_OF(elem)) {
+    if (LAYOUT_OF(elem) == 2) {
+        if (TYPE_OF(elem) == ELEM_FP8) kern_gather2<ELEM_FP8><<<gb, 128, 0, st>>>(data, bases, hdr, tab, low, ids, n_ids, out, Mr, K);
+        else                           kern_gather2<ELEM_BF16><<<gb, 128, 0, st>>>(data, bases, hdr, tab, low, ids, n_ids, out, Mr, K);
+    } else if (LAYOUT_OF(elem)) {
         if (TYPE_OF(elem) == ELEM_FP8) kern_gather1<ELEM_FP8><<<gb, 128, 0, st>>>(data, bases, hdr, tab, low, ids, n_ids, out, Mr, K, SH);
         else                           kern_gather1<ELEM_BF16><<<gb, 128, 0, st>>>(data, bases, hdr, tab, low, ids, n_ids, out, Mr, K, SH);
     } else if (elem == ELEM_FP8) kern_gather<ELEM_FP8><<<gb, 128, 0, st>>>(data, bases, hdr, tab, low, ids, n_ids, out, Mr, K, SH);
@@ -844,5 +1182,11 @@ EXPORT int nwc_setup(void) {
     cudaFuncSetAttribute(kern_block1<0, ELEM_FP8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     cudaFuncSetAttribute(kern_block1<1, ELEM_FP8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     cudaFuncSetAttribute(kern_block1<2, ELEM_FP8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    cudaFuncSetAttribute(kern_block2<0, ELEM_BF16>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    cudaFuncSetAttribute(kern_block2<1, ELEM_BF16>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    cudaFuncSetAttribute(kern_block2<2, ELEM_BF16>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    cudaFuncSetAttribute(kern_block2<0, ELEM_FP8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    cudaFuncSetAttribute(kern_block2<1, ELEM_FP8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    cudaFuncSetAttribute(kern_block2<2, ELEM_FP8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     return g_sms;
 }

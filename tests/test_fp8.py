@@ -12,7 +12,7 @@ torch.manual_seed(0)
 ok_all = True
 
 
-def check(M, K, seed=0):
+def check(M, K, seed=0, layout=None):
     global ok_all
     torch.manual_seed(seed)
     w = torch.randn(M, K) * 0.02
@@ -20,7 +20,7 @@ def check(M, K, seed=0):
     w = w.to(torch.bfloat16)
     q, scale = quantize_fp8(w)
     ref_vals = q.to(torch.bfloat16)                            # unscaled fp8 values, exact in BF16
-    c = NWCWeight(w, elem="fp8")
+    c = NWCWeight(w, elem="fp8", layout=layout)
     back = c.dequant().cpu()
     q2, s2 = c.dequant_fp8()
     x = torch.randn(K)
@@ -35,13 +35,15 @@ def check(M, K, seed=0):
          "scale": torch.equal(s2.cpu(), scale), "gather": torch.equal(rows, ref_vals[ids]),
          "matvec": (y - ref).abs().max().item() <= tol, "ref kernel": (y_ref_kernel - ref).abs().max().item() <= tol}
     ok = all(r.values()); ok_all &= ok
-    print(f"{M:>5} x {K:<5} bits/weight {8*c.bytes/c.n:5.2f} (fp8 8.0, {100*sub:.1f}% e=0)  " +
+    print(f"layout {c.layout} {M:>5} x {K:<5} bits/weight {8*c.bytes/c.n:5.2f} (fp8 8.0, {100*sub:.1f}% e=0)  " +
           "  ".join(f"{k}={'ok' if v else 'FAIL'}" for k, v in r.items()) +
           f"  max|dy| {(y-ref).abs().max().item():.2e} / tol {tol:.2e}")
 
 
-for M, K in [(8, 512), (13, 40), (3, 4097), (1001, 1000), (2560, 4096), (6144, 2560)]:
-    check(M, K, seed=M)
+from nwc.nwc_torch import LAYOUT1, LAYOUT2
+for layout in [0] + ([1] if LAYOUT1 else []) + ([2] if LAYOUT2 else []):
+    for M, K in [(8, 512), (13, 40), (3, 4097), (1001, 1000), (2560, 4096), (6144, 2560)]:
+        check(M, K, seed=M, layout=layout)
 try:
     bad = torch.full((8, 512), float("nan")).to(torch.float8_e4m3fn)
     NWCWeight(bad, elem="fp8", scale=torch.ones(8)); print("NaN accepted: FAIL"); ok_all = False

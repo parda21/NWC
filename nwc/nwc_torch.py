@@ -42,6 +42,14 @@ ELEM_BF16, ELEM_FP8 = 0, 1
 ELEMS = {"bf16": ELEM_BF16, "fp8": ELEM_FP8}
 RAW_SLACK = 512                   # bytes after the raw plane (layout 1 loads one super-chunk ahead without a bounds check)
 LAYOUT1 = bool(ELEM and _lib.nwc_info(6) == 1)   # layout 1: 16-row blocks in tensor-core fragment order (elem |= 16)
+LAYOUT2 = bool(ELEM and _lib.nwc_info(7) == 1)   # layout 2: fixed-width ranks + exception lists, bandwidth-bound (elem |= 32)
+LAYOUTS = {0, 1, 2}
+
+
+def _check_layout(layout):
+    if layout not in LAYOUTS: raise ValueError(f"unknown layout {layout}")
+    if layout == 1 and not LAYOUT1: raise RuntimeError("this NWC library has no layout-1 (tensor-core) support")
+    if layout == 2 and not LAYOUT2: raise RuntimeError("this NWC library has no layout-2 (fixed-width) support")
 # default layout per element type (NWC_LAYOUT=0|1 overrides). Layout 1 (tensor cores) is 9-13 % faster for fp8 on the
 # A16 (10 SMs, issue-bound) but 9 % slower at model level on the RTX 4070 (46 SMs: half as many blocks, longer tail), so
 # it stays opt-in until more GPUs are measured; docs/results.md section 9
@@ -125,7 +133,7 @@ class NWCWeight:
         assert fits(out_f, in_f), f"shape {tuple(w.shape)} not supported"
         self.elem = ELEMS[elem]
         self.layout = LAYOUT_DEFAULT[self.elem] if layout is None else int(layout)
-        if self.layout and not LAYOUT1: raise RuntimeError("this NWC library has no layout-1 (tensor-core) support")
+        _check_layout(self.layout)
         if self.elem == ELEM_FP8:
             if not ELEM: raise RuntimeError("this NWC library has no fp8 support")
             if w.dtype == torch.float8_e4m3fn:
@@ -155,8 +163,9 @@ class NWCWeight:
         for cap in (n + n // 2 + nb * 64 + 4096, 3 * n + nb * 64 + 4096):   # 12 bits per weight is practically always enough
             data = torch.empty(cap, dtype=torch.uint8)
             dl = _lib.nwc_encode(_ptr(src), n, in_f if V9 else block, *_e(self.code), _ptr(freq), _ptr(psym), _ptr(bases), _ptr(hdr), _ptr(data), cap, _ptr(low))
-            if dl >= 0 or dl == -2: break
+            if dl >= 0 or dl in (-2, -3): break
         if dl == -2: raise ValueError("fp8 weights contain NaN")
+        if dl == -3: raise ValueError("layout 2 cannot code this matrix (a lane stream has more than 255 exceptions); use layout 0 or 1")
         if dl < 0: raise RuntimeError("nwc_encode failed")
         lut = torch.empty(TAB_WORDS, dtype=torch.int32)
         _lib.nwc_build_tab(_ptr(freq), _ptr(psym), *_e(self.code), _ptr(lut))
@@ -186,7 +195,7 @@ class NWCWeight:
         self = cls.__new__(cls)
         self.elem = ELEMS[elem]; self.layout = int(layout)
         if self.elem == ELEM_FP8 and not ELEM: raise RuntimeError("this NWC library has no fp8 support")
-        if self.layout and not LAYOUT1: raise RuntimeError("this NWC library has no layout-1 (tensor-core) support")
+        _check_layout(self.layout)
         n = out_f * in_f
         if V9:
             lay = torch.empty(4, dtype=torch.int64)

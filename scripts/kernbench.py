@@ -16,7 +16,7 @@ ap.add_argument("--warm", default="", help="data|low|both: load into the L2 befo
 ap.add_argument("--all", action="store_true", help="also time dequant and the fp32 matvec")
 ap.add_argument("--copies-mb", type=int, default=160, help="working set per shape (L2 of the 4070 = 36 MB)")
 ap.add_argument("--elem", default="bf16", choices=["bf16", "fp8"], help="fp8: NWC-fp8 vs the reference fp8 weight-only matvec (and cuBLAS BF16 for context)")
-ap.add_argument("--layout", type=int, default=None, help="0: 8-row blocks, FFMA; 1: 16-row blocks, tensor-core fragment order (default: library default)")
+ap.add_argument("--layout", type=int, default=None, help="0: 8-row blocks, FFMA; 1: 16-row blocks, tensor-core fragment order; 2: fixed-width ranks (default: library default)")
 a = ap.parse_args()
 
 # (name, M = out, K = in): Qwen3-4B with fused qkv / gate+up, plus lm_head
@@ -51,8 +51,9 @@ for name, M, K in SHAPES:
     def fcublas(): it[0] += 1; return torch.nn.functional.linear(xb, wcs[it[0] % nk], bias)
     if a.elem == "fp8":                            # baseline: the library's fp8 weight-only matvec on the same fp8 values
         q, scale = quantize_fp8(w); q8s = [q.cuda().contiguous() for _ in range(nk)]; sc = scale.cuda()
-        ref = ref_fp8_matvec(q8s[0], sc, xn)
-        def fc(): it[0] += 1; return ref_fp8_matvec(q8s[it[0] % nk], sc, xn)
+        x32 = xb.float()                           # the reference kernel takes fp32 x (layouts >= 1 feed NWC with BF16 x)
+        ref = ref_fp8_matvec(q8s[0], sc, x32)
+        def fc(): it[0] += 1; return ref_fp8_matvec(q8s[it[0] % nk], sc, x32)
         t_cublas = gpu_ms(fcublas, n_runs)
     else:
         ref = torch.nn.functional.linear(xb, wc, bias); fc = fcublas; t_cublas = None
