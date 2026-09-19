@@ -7,11 +7,11 @@ import matplotlib.pyplot as plt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "docs", "img", "headline.png")
-NATIVE, NWC, DF11 = "#9aa5b1", "#1f6feb", "#d29922"
+NATIVE, NWC, FP8, DF11 = "#9aa5b1", "#1f6feb", "#2da44e", "#d29922"
 
 plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 11, "axes.spines.top": False, "axes.spines.right": False,
                      "axes.edgecolor": "#6e7781", "axes.labelcolor": "#24292f", "xtick.color": "#24292f", "ytick.color": "#24292f"})
-fig, axes = plt.subplots(1, 3, figsize=(13, 3.9), dpi=180, gridspec_kw={"width_ratios": [1.15, 1.15, 1.3]})
+fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.0), dpi=180, gridspec_kw={"width_ratios": [1.15, 1.15, 1.3]})
 
 
 def bars(ax, groups, labels, colors, ylabel, title, fmt, ylim=None):
@@ -26,13 +26,14 @@ def bars(ax, groups, labels, colors, ylabel, title, fmt, ylim=None):
     ax.set_ylabel(ylabel); ax.set_title(title, fontsize=11.5, loc="left", color="#24292f")
     ax.grid(axis="y", color="#eaeef2", zorder=0)
     if ylim: ax.set_ylim(*ylim)
-    ax.legend(frameon=False, fontsize=9.5, loc="upper right", ncol=2, columnspacing=0.8, handlelength=1.2)
+    ax.legend(frameon=False, fontsize=9, loc="upper right", ncol=3, columnspacing=0.6, handlelength=1.0)
 
 
 # Qwen3-4B, greedy decoding as a CUDA graph (docs/results.md, section 1)
-bars(axes[0], [("RTX 4070", (45.0, 55.2)), ("A16 (vGPU 16Q)", (16.8, 18.2))], ["native BF16", "NWC"], [NATIVE, NWC],
-     "tokens / s", "Decoding speed, Qwen3-4B (CUDA graph)", lambda v: f"{v:.1f}", (0, 78))
-bars(axes[1], [("RTX 4070", (8.10, 5.67)), ("A16 (vGPU 16Q)", (8.10, 5.67))], ["native BF16", "NWC"], [NATIVE, NWC],
+# NWC fp8 = weight-only fp8 e4m3 with the fp8 values stored lossless (docs/results.md, section 8)
+bars(axes[0], [("RTX 4070", (45.0, 55.2, 73.6)), ("A16 (vGPU 16Q)", (16.8, 18.2, 20.1))], ["native BF16", "NWC BF16", "NWC fp8"], [NATIVE, NWC, FP8],
+     "tokens / s", "Decoding speed, Qwen3-4B (CUDA graph)", lambda v: f"{v:.1f}", (0, 96))
+bars(axes[1], [("RTX 4070", (8.10, 5.67, 3.61)), ("A16 (vGPU 16Q)", (8.10, 5.67, 3.61))], ["native BF16", "NWC BF16", "NWC fp8"], [NATIVE, NWC, FP8],
      "GB", "VRAM in use, Qwen3-4B", lambda v: f"{v:.2f}", (0, 11.5))
 # RTX 4070, GPU time per token, HF eager, torch.profiler (docs/results.md, section 2)
 ax = axes[2]

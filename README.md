@@ -3,25 +3,28 @@
 # NWC · Neural Weight Compression
 
 **Lossless BF16 weights, 31 % smaller, decoded inside the CUDA matvec.**
-Faster than cuBLAS on the uncompressed weights. Bit-identical weights, no quantization.
+Faster than cuBLAS on the uncompressed weights, bit-identical, no quantization.
+And for fp8 models: the fp8 values stored lossless at 0.87 of their size, at native fp8 speed.
 
 [![PyPI](https://img.shields.io/pypi/v/neural-weight-compression?label=pypi&color=1f6feb)](https://pypi.org/project/neural-weight-compression/)
 [![downloads](https://img.shields.io/pypi/dm/neural-weight-compression?color=1f6feb)](https://pypi.org/project/neural-weight-compression/)
 [![ci](https://github.com/parda21/NWC/actions/workflows/ci.yml/badge.svg)](https://github.com/parda21/NWC/actions/workflows/ci.yml)
 [![model](https://img.shields.io/badge/%F0%9F%A4%97%20checkpoint-Qwen3--4B--NWC-ffcc4d)](https://huggingface.co/Parda21/Qwen3-4B-NWC)
+[![fp8 model](https://img.shields.io/badge/%F0%9F%A4%97%20fp8-Qwen3--4B--NWC--fp8-2da44e)](https://huggingface.co/Parda21/Qwen3-4B-NWC-fp8)
 [![license](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
 
 [Quickstart](#quickstart) · [Results](#results) · [How it works](#how-it-works) · [Hardware](#hardware) · [Roadmap](#roadmap) · [FAQ](#faq) · [For agents](#for-agents)
 
 </div>
 
-![Qwen3-4B: tokens/s, VRAM, and GPU time per token vs DFloat11](docs/img/headline.png)
+![Qwen3-4B: tokens/s and VRAM for native BF16, NWC BF16 and NWC fp8; GPU time per token vs DFloat11](docs/img/headline.png)
 
 Token generation is memory-bound: every weight is read once per token. NWC stores the weights entropy-coded
 in VRAM and decodes them in registers, inside the matrix-vector kernel, so the GPU reads 69 % of the bytes and
 no decompressed weight ever touches memory. On an RTX 4070 that makes Qwen3-4B **22 % faster** than native BF16
 while using **2.4 GB less VRAM**; on a bandwidth-starved NVIDIA A16 it is still faster. Qwen2.5-7B in full BF16
-fits a 12 GB card.
+fits a 12 GB card. The same decoder runs **weight-only fp8** models with the fp8 values stored lossless: Qwen3-4B in
+**3.61 GB** at **73.6 tokens/s** on the 4070, as fast as a native fp8 matvec and 13 % smaller than fp8.
 
 ## News
 
@@ -44,7 +47,8 @@ Needs an NVIDIA GPU (Turing or newer, Ampere or newer measured), a driver for CU
 pip install neural-weight-compression transformers accelerate
 python -m nwc.doctor                                          # GPU, driver, library, kernel round trip: all ok?
 python -m nwc.demo Parda21/Qwen3-0.6B-NWC --load --graph      # 1 minute, 0.8 GB download: does everything run?
-python -m nwc.demo Parda21/Qwen3-4B-NWC --load --graph        # 5.6 GB: the model the numbers above are from
+python -m nwc.demo Parda21/Qwen3-4B-NWC --load --graph        # 5.6 GB: lossless BF16, the model the numbers above are from
+python -m nwc.demo Parda21/Qwen3-4B-NWC-fp8 --load --graph    # 3.5 GB: weight-only fp8, fp8 values lossless
 python -m nwc.demo Qwen/Qwen3-4B --native --graph             # the same model uncompressed, for comparison
 ```
 
@@ -91,6 +95,22 @@ by `torch.profiler` ([scripts/compare_df11.py](scripts/compare_df11.py)):
 
 Same size, opposite speed: DFloat11's decoded weights pass through memory twice, NWC reads only the compressed
 bytes. Both land at the entropy of the mantissa; the choice of coder moves the size by 1–2 %.
+
+**fp8.** `convert(model, elem="fp8")` quantizes to weight-only fp8 e4m3 (per-channel scale, activations BF16, the
+recipe vLLM & co. serve) and stores the fp8 values lossless. Qwen3-4B, CUDA graph, greedy; the baseline is the
+library's own fp8 weight-only matvec, which reads one byte per weight at the memory bandwidth
+([docs/results.md](docs/results.md), section 8):
+
+| | RTX 4070 | NVIDIA A16 |
+|---|---|---|
+| VRAM, native BF16 → NWC fp8 | 8.10 GB → **3.61 GB** | 8.10 GB → **3.61 GB** |
+| tokens/s, native BF16 → NWC fp8 | 45 → **73.6** | 16.8 → **20.1** (21.7 with `layout=1`) |
+| weight kernels vs native fp8 matvec | 0.85–1.09× (parity) | 0.70× (0.80× with `layout=1`) |
+| size vs fp8 | **0.87** | **0.87** |
+| perplexity WikiText-2, BF16 → fp8 | 18.03 → 18.15 (the fp8 quantization; NWC changes nothing) | |
+
+int8 was measured and not built: its symbol alphabet is flat, the prefix code would save 5 %, an ideal coder 13 %
+(section 7 there).
 
 ## How it works
 
