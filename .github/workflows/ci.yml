@@ -1,0 +1,44 @@
+# No GPU on GitHub runners, so CI does what can be done without one: compile the kernel library for every
+# architecture the wheel ships, run the pure-Python format test against it, build and import the wheel.
+# GPU tests (tests/test_k.py etc.) are run by hand before a release; their output goes into the release notes.
+name: ci
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "*.md"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.6.3-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: python
+        run: |
+          apt-get update -qq && apt-get install -y -qq python3 python3-pip python3-venv git > /dev/null
+          python3 -m pip install -q --upgrade pip
+          python3 -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          python3 -m pip install -q safetensors build wheel
+      - name: compile kernel library (sm_75 .. sm_90 + PTX)
+        run: |
+          mkdir -p nwc/lib
+          nvcc -O3 --shared -Xcompiler -fPIC -o nwc/lib/nwc_ops.so csrc/nwc_ops.cu \
+            -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 \
+            -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
+            -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90,code=compute_90
+          ls -la nwc/lib
+      - name: format test (reference decoder, no GPU)
+        run: python3 tests/test_format_cpu.py
+      - name: wheel
+        run: |
+          python3 -m pip wheel . --no-deps --no-build-isolation -w dist
+          python3 -m wheel tags --python-tag py3 --abi-tag none --platform-tag manylinux_2_35_x86_64 --remove dist/*.whl
+          python3 -m pip install -q dist/*.whl
+          cd / && python3 -c "import nwc, nwc.doctor; print('import ok', nwc.__version__, nwc.nwc_torch._LIB_PATH)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux
+          path: dist/*.whl
+          retention-days: 14

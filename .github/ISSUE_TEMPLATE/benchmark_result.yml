@@ -1,0 +1,45 @@
+name: Benchmark result
+description: Share numbers from a GPU (H100, A100, 4090, T4, ... anything not yet in the hardware table)
+title: "[bench] <GPU name>"
+labels: [benchmark]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks. Every GPU we have not measured ourselves goes into the hardware table in the README with your name.
+        ```bash
+        pip install neural-weight-compression transformers accelerate
+        python -m nwc.doctor
+        python -m nwc.demo Parda21/Qwen3-4B-NWC --load --graph
+        python -m nwc.demo Qwen/Qwen3-4B --native --graph
+        ```
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `python -m nwc.doctor`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: nwc
+    attributes:
+      label: Output of the NWC run (`--load --graph`)
+      description: The lines "VRAM in use", "generate", "CUDA graph".
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: native
+    attributes:
+      label: Output of the native run (`--native --graph`)
+      render: text
+  - type: textarea
+    id: kernbench
+    attributes:
+      label: Optional, from a clone, `python scripts/kernbench.py --runs 30`
+      render: text
+  - type: input
+    id: credit
+    attributes:
+      label: How to credit you in the table
+      placeholder: GitHub handle, or "no credit"

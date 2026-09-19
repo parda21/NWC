@@ -1,0 +1,30 @@
+name: Bug report
+description: Something does not build, load, or produce the right result
+labels: [bug]
+body:
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `python -m nwc.doctor`
+      description: It reports GPU, driver, torch build, library and whether the kernel round trip works.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran and the full error or the wrong output.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      placeholder: e.g. Parda21/Qwen3-4B-NWC or Qwen/Qwen3-4B
+  - type: input
+    id: version
+    attributes:
+      label: NWC version and how it was installed
+      placeholder: e.g. 0.9.1 from PyPI, or commit abc123 with python -m nwc.build
