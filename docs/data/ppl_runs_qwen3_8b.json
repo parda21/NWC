@@ -1,0 +1,33 @@
+[
+ {
+  "label": "Qwen3-8B NWC fp8",
+  "model": "Qwen/Qwen3-8B",
+  "variant": "nwc-fp8",
+  "elem": "fp8",
+  "bytes": 7934815200,
+  "bytes_matrices": 6689539040,
+  "ppl": 8.722234725952148,
+  "nll": 321275.12255859375,
+  "count": 148335,
+  "n_ctx": 2048,
+  "chunks": 145,
+  "text": "wiki.test.raw",
+  "gpu": "NVIDIA GeForce RTX 4070",
+  "note": "bytes = compressed linears + lm_head, BF16 embedding as run (before convert compressed untied embeddings), norms"
+ },
+ {
+  "label": "Qwen3-8B bf16 (PyTorch, offload)",
+  "model": "Qwen/Qwen3-8B",
+  "variant": "bf16",
+  "elem": "bf16",
+  "bytes": 16381471232,
+  "bytes_matrices": null,
+  "ppl": 8.677715301513672,
+  "nll": 320516.0673828125,
+  "count": 148335,
+  "n_ctx": 2048,
+  "chunks": 145,
+  "text": "wiki.test.raw",
+  "gpu": "NVIDIA GeForce RTX 4070"
+ }
+]

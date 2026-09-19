@@ -269,3 +269,40 @@ Edge handling worth knowing: a 16-column chunk is not one mma (the super-chunk c
 so matrices whose `K16` is an odd multiple of 16 code whole super-chunks with fillers, and the dequantization and
 gather kernels guard their stores with `column < K16`; the first version wrote filler columns past the row end
 and corrupted neighbouring tensors.
+
+## 10. Size vs quality on one base model: Qwen3-8B, NWC and Ternary Bonsai 8B
+
+The interesting comparison with ternary models is not head to head (a ternary weight is 1.6 bits, there is nothing
+left for a lossless coder to remove) but where each option sits on the size-quality curve of the same base model.
+Every point below is measured with the same method on the same text: WikiText-2 test, 298 939 Qwen tokens, 145
+consecutive chunks of 2048, the second half of each chunk scored (the `llama-perplexity` convention;
+[scripts/ppl_curve.py](../scripts/ppl_curve.py) reproduces it in PyTorch for the BF16, fp8 and NWC points, the GGUF
+model is scored by `llama-perplexity` of the [PrismML fork of llama.cpp](https://github.com/PrismML-Eng/llama.cpp),
+branch `prism`, built with CUDA). Sizes are all weights in memory, embedding included.
+
+![Qwen3-8B: memory vs quality](img/curve_qwen3_8b.png)
+
+| Qwen3-8B | GB | perplexity | vs BF16 | how |
+|---|---|---|---|---|
+| BF16 | 16.38 | 8.6777 | | Transformers, 9 GB on the RTX 4070, the rest streamed from RAM |
+| **NWC BF16** | **11.33** (0.69) | 8.6777 | identical | lossless: same weights, same logits ([tests](../tests/test_checkpoint.py)) |
+| fp8 e4m3 weight-only | 8.82 | 8.7222 | +0.51 % | per-channel absmax scale, embedding BF16 |
+| **NWC fp8** | **7.55** (0.86 of fp8) | 8.7222 | +0.51 % | the fp8 values stored lossless, embedding NWC BF16 |
+| Ternary Bonsai 8B | 2.18 | 9.8752 | +13.8 % | `Ternary-Bonsai-8B-PQ2_0.gguf`, PrismML fork, all layers on the GPU |
+
+Toolchain check, so the GGUF point is comparable with the PyTorch points: Qwen3-0.6B BF16 scored by both over the
+same 145 chunks gives 18.129 (PyTorch) and 18.112 (llama-perplexity), 0.09 % apart; the same token count and chunk
+count on both sides. The fp8 point is one measurement (NWC fp8), since NWC stores the fp8 values bit-exact and the
+prefill path multiplies the dequantized fp8 values with the same per-row scale; the BF16 and NWC BF16 points are
+identical for the same reason. What the curve says: ternary is the right choice when 14 % more perplexity is
+acceptable for an 8× smaller model, NWC is the choice when nothing may change (BF16) or when the industry's fp8
+recipe is the quality floor, and it costs no training or calibration. Ternary Bonsai 8B is the first Bonsai
+generation (PrismML quotes 95 % of the base model's benchmark aggregate); Bonsai 2 (98.2 %) exists as 27B only,
+which needs an 80 GB card for the BF16 and NWC points ([#2](https://github.com/parda21/NWC/issues/2)). Tokens per
+second are deliberately not on the chart: different runtimes.
+
+Sizes come from encoding every 2-D tensor of the checkpoint ([docs/data/size_qwen3_8b.json](data/size_qwen3_8b.json); the raw
+perplexity runs are in [docs/data/ppl_runs_qwen3_8b.json](data/ppl_runs_qwen3_8b.json)):
+15.14 GB of linear layers plus lm_head, 1.24 GB embedding; NWC BF16 10.47 + 0.86 GB; fp8 7.57 (+ scales) + 1.24 GB;
+NWC fp8 6.69 + 0.86 GB. From this version `convert` also compresses untied embedding tables (always lossless BF16,
+looked up by the gather kernel), which is where the 0.86 GB comes from.

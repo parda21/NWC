@@ -37,7 +37,8 @@ python -m nwc.build                       # fatbin into nwc/lib (what the wheel 
 | `python tests/test_nwc_torch.py` | GPU, `data/W.raw` | PyTorch bridge, speed vs cuBLAS on one matrix |
 
 Benchmarks: `scripts/kernbench.py` (kernel vs cuBLAS per layer shape; `--elem fp8` against the reference fp8 matvec), `scripts/graph_decode.py --mode nwc --fusion`
-(tokens/s as a CUDA graph), `scripts/compare_df11.py` (against DFloat11). CI (`.github/workflows/ci.yml`) compiles
+(tokens/s as a CUDA graph), `scripts/compare_df11.py` (against DFloat11), `scripts/ppl_curve.py` (perplexity with the llama.cpp method, so PyTorch points and GGUF models
+scored by `llama-perplexity` share one curve; `scripts/plot_curve.py` draws it from `docs/data/*.json`). CI (`.github/workflows/ci.yml`) compiles
 the library for every architecture and runs the CPU test; GPU tests are run by hand before a release and the
 output is pasted into the release notes.
 

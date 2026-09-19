@@ -1,0 +1,73 @@
+{
+ "title": "Qwen3-8B: memory vs quality, every point measured the same way",
+ "image": "curve_qwen3_8b.png",
+ "xmax": 18.5,
+ "ylim": [
+  8.35,
+  10.2
+ ],
+ "note": "WikiText-2 test, 145 x 2048 tokens, llama.cpp perplexity method (scripts/ppl_curve.py, llama-perplexity for GGUF)",
+ "points": [
+  {
+   "label": "BF16 (Transformers)",
+   "gb": 16.38,
+   "ppl": 8.6777,
+   "kind": "native",
+   "reference": true,
+   "offset": [
+    -10,
+    16
+   ],
+   "ha": "right",
+   "va": "center"
+  },
+  {
+   "label": "NWC BF16 (lossless)",
+   "gb": 11.33,
+   "ppl": 8.6777,
+   "kind": "nwc",
+   "offset": [
+    8,
+    -14
+   ],
+   "ha": "left",
+   "va": "top"
+  },
+  {
+   "label": "fp8 e4m3 weight-only",
+   "gb": 8.82,
+   "ppl": 8.7222,
+   "kind": "fp8",
+   "offset": [
+    0,
+    14
+   ],
+   "ha": "center",
+   "va": "bottom"
+  },
+  {
+   "label": "NWC fp8 (lossless on the fp8 values)",
+   "gb": 7.55,
+   "ppl": 8.7222,
+   "kind": "nwc",
+   "offset": [
+    -6,
+    -14
+   ],
+   "ha": "right",
+   "va": "top"
+  },
+  {
+   "label": "Ternary Bonsai 8B (PQ2_0, PrismML fork of llama.cpp)",
+   "gb": 2.18,
+   "ppl": 9.8752,
+   "kind": "other",
+   "offset": [
+    12,
+    0
+   ],
+   "ha": "left",
+   "va": "center"
+  }
+ ]
+}

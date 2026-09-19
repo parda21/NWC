@@ -32,6 +32,8 @@ memory and the GPU reads fewer bytes per token.
 
 ## News
 
+- **main** · size-vs-quality curve on Qwen3-8B against Ternary Bonsai 8B, every point measured the same way
+  (`scripts/ppl_curve.py`); `convert` now also compresses untied embedding tables (lossless).
 - **main** · tensor-core accumulation layout (format v10, opt-in `layout=1`): fp8 kernels on the A16 9–13 % faster, at parity on the 4070; v9 checkpoints keep loading ([docs/results.md](docs/results.md), section 9).
 - **main** · fp8: weight-only fp8 e4m3 models (per-channel scale) with the fp8 values stored lossless, 0.87 of the
   fp8 size, same speed as a native fp8 matvec on the RTX 4070 and 1.2–2.1× cuBLAS BF16 (`--fp8` in the demo,
@@ -117,6 +119,19 @@ library's own fp8 weight-only matvec, which reads one byte per weight at the mem
 ¹ `python -m nwc.demo MODEL --native-fp8`: the same quantization served uncompressed by the library's reference
 fp8 matvec; its tied `lm_head` stays BF16, hence the extra VRAM. An external baseline (vLLM fp8) is
 [#10](https://github.com/parda21/NWC/issues/10).
+
+**Size vs quality, one base model.** Where NWC sits next to a ternary model of the same base (Qwen3-8B, all points
+measured with the same perplexity method on the same text; [docs/results.md](docs/results.md), section 10):
+
+![Qwen3-8B: memory vs quality](docs/img/curve_qwen3_8b.png)
+
+| Qwen3-8B | BF16 | **NWC BF16** | fp8 | **NWC fp8** | Ternary Bonsai 8B |
+|---|---|---|---|---|---|
+| weights in memory | 16.38 GB | **11.33 GB** | 8.82 GB | **7.55 GB** | 2.18 GB |
+| perplexity WikiText-2 | 8.678 | **8.678** | 8.722 | **8.722** | 9.875 |
+
+Ternary is the right choice when 14 % more perplexity buys an 8× smaller model; NWC is the choice when nothing may
+change, or when fp8 is the quality floor, without training or calibration.
 
 int8 was measured and not built: its symbol alphabet is flat, the prefix code would save 5 %, an ideal coder 13 %
 (section 7 there).

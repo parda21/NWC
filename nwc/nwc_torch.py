@@ -377,9 +377,10 @@ def fuse(model: nn.Module, groups=(("q_proj", "k_proj", "v_proj"), ("gate_proj",
     return n_fused
 
 
-def convert(model: nn.Module, device="cuda", verbose=True, tied=True, elem="bf16"):
+def convert(model: nn.Module, device="cuda", verbose=True, tied=True, elem="bf16", embeddings=True):
     """Replace every supported nn.Linear (and a tied embedding) by NWC modules; move the rest to `device`.
     elem "bf16": lossless; "fp8": weight-only fp8 e4m3 (per-channel scale), the fp8 values stored lossless.
+    embeddings: also compress untied nn.Embedding tables (always lossless BF16, looked up with the gather kernel).
     Returns (bytes_nwc, bytes_bf16) of the compressed matrices."""
     total_nwc = total_bf16 = 0
     replaced, skipped, blocks = 0, [], {}
@@ -401,6 +402,16 @@ def convert(model: nn.Module, device="cuda", verbose=True, tied=True, elem="bf16
             blocks[w.block] = blocks.get(w.block, 0) + 1
             shared_ptrs.discard(cm.weight.data_ptr())
             emb.weight.data = torch.empty(0); cm.weight.data = torch.empty(0)
+    if embeddings:                                                # untied embedding tables: lossless BF16, gather kernel
+        for name, mod in list(model.named_modules()):
+            for child, cm in list(mod.named_children()):
+                if isinstance(cm, nn.Embedding) and cm.weight.dtype == torch.bfloat16 and cm.weight.numel() \
+                   and fits(cm.num_embeddings, cm.embedding_dim):
+                    w = NWCWeight(cm.weight.data, device, elem="bf16")
+                    setattr(mod, child, NWCEmbedding(cm, w))
+                    total_nwc += w.bytes; total_bf16 += w.bytes_bf16; replaced += 1
+                    blocks[w.block] = blocks.get(w.block, 0) + 1
+                    cm.weight.data = torch.empty(0)
     for m in model.modules():                                     # count layers fused earlier
         if isinstance(m, _FusedHead) and m.index == 0:
             w = m.g["lin"].w; total_nwc += w.bytes; total_bf16 += w.bytes_bf16; replaced += 1
