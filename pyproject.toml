@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "neural-weight-compression"
 version = "0.10.1"
-description = "NWC: lossless BF16 weight compression with a fused CUDA matvec that decodes in registers"
+description = "NWC: lossless compression of LLM weights (BF16 31 % smaller and faster than cuBLAS, fp8 13 % smaller at native speed) with a fused CUDA matvec that decodes in registers"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"

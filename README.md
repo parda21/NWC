@@ -2,9 +2,9 @@
 
 # NWC · Neural Weight Compression
 
-**Lossless BF16 weights, 31 % smaller, decoded inside the CUDA matvec.**
-Faster than cuBLAS on the uncompressed weights, bit-identical, no quantization.
-And for fp8 models: the fp8 values stored lossless at 0.87 of their size, at native fp8 speed.
+**Lossless compression of LLM weights, decoded inside the CUDA matvec.**
+BF16 models: 31 % smaller and faster than cuBLAS. fp8 models: 13 % smaller at native fp8 speed.
+Bit-identical weights either way, no extra quantization.
 
 [![PyPI](https://img.shields.io/pypi/v/neural-weight-compression?label=pypi&color=1f6feb)](https://pypi.org/project/neural-weight-compression/)
 [![downloads](https://img.shields.io/pypi/dm/neural-weight-compression?color=1f6feb)](https://pypi.org/project/neural-weight-compression/)
@@ -20,11 +20,15 @@ And for fp8 models: the fp8 values stored lossless at 0.87 of their size, at nat
 ![Qwen3-4B: tokens/s and VRAM for native BF16, NWC BF16 and NWC fp8; GPU time per token vs DFloat11](docs/img/headline.png)
 
 Token generation is memory-bound: every weight is read once per token. NWC stores the weights entropy-coded
-in VRAM and decodes them in registers, inside the matrix-vector kernel, so the GPU reads 69 % of the bytes and
-no decompressed weight ever touches memory. On an RTX 4070 that makes Qwen3-4B **22 % faster** than native BF16
-while using **2.4 GB less VRAM**; on a bandwidth-starved NVIDIA A16 it is still faster. Qwen2.5-7B in full BF16
-fits a 12 GB card. The same decoder runs **weight-only fp8** models with the fp8 values stored lossless: Qwen3-4B in
-**3.61 GB** at **73.6 tokens/s** on the 4070, as fast as a native fp8 matvec and 13 % smaller than fp8.
+in VRAM and decodes them in registers, inside the matrix-vector kernel, so no decompressed weight ever touches
+memory and the GPU reads fewer bytes per token.
+
+- **BF16** (the checkpoint as published, no quantization): 69 % of the bytes. Qwen3-4B on an RTX 4070 runs
+  **22 % faster** than native BF16 in **2.4 GB less VRAM**; on a bandwidth-starved NVIDIA A16 it is still faster.
+  Qwen2.5-7B in full BF16 fits a 12 GB card.
+- **fp8** (weight-only e4m3, the format serving stacks use): the fp8 values stored lossless at 87 % of their bytes.
+  Qwen3-4B in **3.61 GB** at **73.6 tokens/s** on the 4070, the speed of a native fp8 matvec.
+- **int8**: measured, not built. Its symbols are nearly incompressible (5 % with this coder, 13 % with an ideal one).
 
 ## News
 
