@@ -214,5 +214,14 @@ block's rows into L1 or the next block into L2 (compile switches `PF_ROWS_L1`, `
 Ampere for it; the cause is open (Nsight Compute is not installed here). Closing that gap would make fp8 on
 the 4070 bandwidth-bound (1.14× native fp8) and BF16 on the 4080 Super / 4090 more comfortable.
 
+Model level, Qwen3-4B on the RTX 4070 (`python -m nwc.demo models/Qwen3-4B --fp8 --graph --tokens 128`):
+
+| | native BF16 | NWC (BF16, lossless) | fp8 weight-only, NWC-coded |
+|---|---|---|---|
+| linear weights | 8.04 GB | 5.55 GB | **3.54 GB** (0.88 of fp8, 0.44 of BF16) |
+| VRAM in use | 8.10 GB | 5.67 GB | **3.61 GB** |
+| tokens/s, CUDA graph, greedy | 45 | 55 | **73.6** |
+| perplexity WikiText-2 (16 × 1024) | 18.03 | = native | 18.15 (+0.7 %, the fp8 quantization) |
+
 Quantized entropies (section 7) put the ceiling for fp8 at 0.828 with an ideal coder on the 4-bit exponent;
-the decoder-friendly split costs 0.866 (+4.6 %).
+the decoder-friendly split costs 0.866 (+4.6 %); with the LUTs, headers and scales the checkpoint lands at 0.88.
