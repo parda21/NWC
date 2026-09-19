@@ -291,8 +291,9 @@ branch `prism`, built with CUDA). Sizes are all weights in memory, embedding inc
 | Ternary Bonsai 8B | 2.18 | 9.8752 | +13.8 % | `Ternary-Bonsai-8B-PQ2_0.gguf`, PrismML fork, all layers on the GPU |
 
 Toolchain check, so the GGUF point is comparable with the PyTorch points: Qwen3-0.6B BF16 scored by both over the
-same 145 chunks gives 18.129 (PyTorch) and 18.112 (llama-perplexity), 0.09 % apart; the same token count and chunk
-count on both sides. The fp8 point is one measurement (NWC fp8), since NWC stores the fp8 values bit-exact and the
+same 145 chunks gives 18.129 (PyTorch) and 18.112 (llama-perplexity), 0.09 % apart, and Qwen3-8B BF16 itself gives 8.6777 (PyTorch)
+and 8.6671 (llama-perplexity, BF16 GGUF, 20 layers on the GPU), 0.12 % apart; the same token count and chunk count on
+both sides. The fp8 point is one measurement (NWC fp8), since NWC stores the fp8 values bit-exact and the
 prefill path multiplies the dequantized fp8 values with the same per-row scale; the BF16 and NWC BF16 points are
 identical for the same reason. What the curve says: ternary is the right choice when 14 % more perplexity is
 acceptable for an 8× smaller model, NWC is the choice when nothing may change (BF16) or when the industry's fp8
