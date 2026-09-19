@@ -36,7 +36,7 @@ class Bits:
 def decode(c: NWCWeight) -> torch.Tensor:
     M, K, K16 = c.out_features, c.in_features, c.K16
     CB = (K + COLS - 1) // COLS
-    data, bases, hdr, low = c.data.cpu().numpy().tobytes(), c.bases.cpu().tolist(), c.hdr.cpu().tolist(), c.low.cpu()
+    data, bases, hdr, low = bytes(c.data.cpu().tolist()), c.bases.cpu().tolist(), c.hdr.cpu().tolist(), c.low.cpu()
     eor = exp_of_rank(c.lut.cpu().tolist())
     high = torch.zeros(M, K, dtype=torch.int32)
     for b in range(len(bases)):
