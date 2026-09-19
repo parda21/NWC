@@ -4,7 +4,7 @@ usage:
   python -m nwc.demo Qwen/Qwen3-4B --native            # comparison: uncompressed
   python -m nwc.demo Qwen/Qwen3-4B --graph             # also tokens/s as a CUDA graph (no Python overhead)
   python -m nwc.demo Qwen/Qwen3-4B --save Qwen3-4B-NWC # write a compressed checkpoint
-  python -m nwc.demo Qwen3-4B-NWC --load               # load a compressed checkpoint (no BF16 originals needed)
+  python -m nwc.demo Parda21/Qwen3-4B-NWC --load       # load a compressed checkpoint (local dir or HF repo id)
 """
 import time, argparse, torch
 
@@ -20,16 +20,23 @@ def main():
     ap.add_argument("--graph", action="store_true", help="time the decode step as a CUDA graph")
     ap.add_argument("--prompt", default="Question: What is a binary tree and its applications? Answer:")
     a = ap.parse_args()
+    if not torch.cuda.is_available():
+        raise SystemExit("no CUDA device available; run `python -m nwc.doctor` to see what is missing")
     from transformers import AutoTokenizer, AutoModelForCausalLM
+    from .checkpoint import resolve
+    import os
 
     t0 = time.time()
+    path = resolve(a.model)
+    if not a.load and os.path.exists(os.path.join(path, "nwc_config.json")):
+        print("NWC: this is a compressed checkpoint, loading it (as with --load)"); a.load = True
     if a.load:
         from .checkpoint import load_pretrained
-        model = load_pretrained(a.model)
-        tok = AutoTokenizer.from_pretrained(a.model)
+        model = load_pretrained(path)
+        tok = AutoTokenizer.from_pretrained(path)
     else:
-        tok = AutoTokenizer.from_pretrained(a.model)
-        model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, device_map="cpu", low_cpu_mem_usage=True)
+        tok = AutoTokenizer.from_pretrained(path)
+        model = AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16, device_map="cpu", low_cpu_mem_usage=True)
         if a.native:
             model.cuda()
         else:

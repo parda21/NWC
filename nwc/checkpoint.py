@@ -67,11 +67,27 @@ def _set(model, path, module):
     setattr(model.get_submodule(parent) if parent else model, name, module)
 
 
+def resolve(path: str) -> str:
+    """A local directory as is; otherwise a Hugging Face repo id (e.g. Parda21/Qwen3-4B-NWC), downloaded to the HF cache."""
+    if os.path.isdir(path): return path
+    if os.path.exists(path): raise FileNotFoundError(f"{path} is a file, an NWC checkpoint is a directory")
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        raise FileNotFoundError(f"{path} is not a directory, and huggingface_hub (for downloading repo ids) is not installed")
+    return snapshot_download(path)
+
+
 def load_pretrained(path: str, device="cuda", verbose=True):
-    """Load an NWC checkpoint: returns the model on `device` with NWC modules in place, no BF16 originals in RAM."""
+    """Load an NWC checkpoint (local directory or Hugging Face repo id): returns the model on `device` with NWC modules
+    in place, no BF16 originals in RAM."""
     from transformers import AutoConfig, AutoModelForCausalLM
     from accelerate import init_empty_weights
     from accelerate.utils import set_module_tensor_to_device
+    path = resolve(path)
+    if not os.path.exists(os.path.join(path, "nwc_config.json")):
+        raise FileNotFoundError(f"{path} is not an NWC checkpoint (no nwc_config.json); a plain HF model is compressed with "
+                                "nwc.convert or `python -m nwc.demo MODEL` without --load")
     with open(os.path.join(path, "nwc_config.json"), encoding="utf-8") as f: config = json.load(f)
     if config["library_version"] != VERSION:
         raise RuntimeError(f"checkpoint is format version {config['library_version']}, library is {VERSION}")
@@ -107,3 +123,45 @@ def load_pretrained(path: str, device="cuda", verbose=True):
         print(f"NWC: checkpoint loaded, {config['bytes_bf16']/1e9:.2f} GB BF16 -> {config['bytes_nwc']/1e9:.2f} GB "
               f"(ratio {config['bytes_nwc']/max(config['bytes_bf16'],1):.4f}), VRAM in use {torch.cuda.memory_allocated()/1e9:.2f} GB")
     return model
+
+
+def export_bf16(path: str, out: str, device="cuda", verbose=True):
+    """Turn an NWC checkpoint back into a plain BF16 Transformers checkpoint (bit-identical weights) at `out`.
+    Use it to run the model with tools that do not know NWC (llama.cpp converters, vLLM, ...). Returns the BF16 byte count."""
+    import shutil
+    path = resolve(path)
+    with open(os.path.join(path, "nwc_config.json"), encoding="utf-8") as f: config = json.load(f)
+    if config["library_version"] != VERSION:
+        raise RuntimeError(f"checkpoint is format version {config['library_version']}, library is {VERSION}")
+    with open(os.path.join(path, "config.json"), encoding="utf-8") as f: tied = json.load(f).get("tie_word_embeddings", False)
+    tensors = load_file(os.path.join(path, "model.safetensors"))
+    embedding_ids = {m["weight"] for m in config["modules"] if m["kind"] == "embedding"}
+    result, total = {}, 0
+    for e in config["weights"]:
+        t = {n: tensors.pop(f"nwc/{e['id']}/{n}") for n in TENSOR_NAMES}
+        w = NWCWeight.from_tensors(e["out"], e["in"], e["block"], t["data"], t["bases"], t["hdr"], t["lut"], t["low"], device)
+        full = w.dequant().contiguous().cpu(); del w
+        total += full.numel() * 2
+        for m in config["modules"]:
+            if m["weight"] != e["id"]: continue
+            if m["kind"] == "embedding":
+                result[f"{m['path']}.weight"] = full
+            elif m["kind"] == "linear":
+                if not (tied and e["id"] in embedding_ids): result[f"{m['path']}.weight"] = full   # tied lm_head: embedding only
+                if m["bias"]: result[f"{m['path']}.bias"] = tensors.pop(m["bias"])
+            else:
+                bias = tensors.pop(m["bias"]) if m["bias"] else None
+                a = 0
+                for name, size in zip(m["names"], m["sizes"]):
+                    key = f"{m['path']}.{name}" if m["path"] else name
+                    result[f"{key}.weight"] = full[a:a + size].clone()
+                    if bias is not None: result[f"{key}.bias"] = bias[a:a + size].clone()
+                    a += size
+    result.update(tensors)
+    os.makedirs(out, exist_ok=True)
+    save_file(result, os.path.join(out, "model.safetensors"), metadata={"format": "pt"})
+    for name in os.listdir(path):
+        if name not in ("model.safetensors", "nwc_config.json") and os.path.isfile(os.path.join(path, name)):
+            shutil.copyfile(os.path.join(path, name), os.path.join(out, name))
+    if verbose: print(f"NWC: exported {total/1e9:.2f} GB of BF16 weights to {out}")
+    return total

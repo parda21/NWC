@@ -1,13 +1,13 @@
 """Build the CUDA library from csrc/nwc_ops.cu into nwc/lib/ (for installations from source).
 usage: python -m nwc.build [--arch sm_86,sm_89] [--nvcc PATH]
-Without --arch the result is a fatbin for sm_80, sm_86, sm_89, sm_90 plus PTX for compute_90 (JIT-compiled on newer
+Without --arch the result is a fatbin for sm_75, sm_80, sm_86, sm_89, sm_90 plus PTX for compute_90 (JIT-compiled on newer
 GPUs). Windows needs the MSVC environment (vcvars64.bat) in the calling terminal or Visual Studio in its default path."""
 import os, shutil, subprocess, argparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SOURCE = os.path.join(os.path.dirname(HERE), "csrc", "nwc_ops.cu")
 TARGET_DIR = os.path.join(HERE, "lib")
-ARCHS = ["sm_80", "sm_86", "sm_89", "sm_90"]
+ARCHS = ["sm_75", "sm_80", "sm_86", "sm_89", "sm_90"]
 
 
 def gencode(archs):
@@ -48,7 +48,7 @@ def build(archs=None, nvcc=None, target_dir=TARGET_DIR, source=SOURCE):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arch", default="", help="comma list, e.g. sm_86,sm_89 (default: sm_80..sm_90 + PTX)")
+    ap.add_argument("--arch", default="", help="comma list, e.g. sm_86,sm_89 (default: sm_75..sm_90 + PTX)")
     ap.add_argument("--nvcc", default=None)
     a = ap.parse_args()
     build([x.strip() for x in a.arch.split(",") if x.strip()] or None, a.nvcc)

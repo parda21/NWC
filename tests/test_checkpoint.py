@@ -14,6 +14,7 @@ cfg = Qwen2Config(vocab_size=4096, hidden_size=256, intermediate_size=1000, num_
 model = AutoModelForCausalLM.from_config(cfg, dtype=torch.bfloat16).eval()   # like load_pretrained(): buffers (inv_freq) stay fp32
 ids = torch.randint(0, cfg.vocab_size, (1, 12))
 with torch.no_grad(): ref = model(ids).logits.float().cuda()          # BF16 reference on the CPU
+state = {k: v.clone() for k, v in model.state_dict().items()}          # originals, for the export check
 
 fuse(model); convert(model)
 with torch.no_grad(): a = model(ids.cuda()).logits.float()
@@ -28,6 +29,19 @@ try:
     dref = (b - ref).abs().max().item()
     print(f"logits identical after loading: {same}; max |d| to the BF16 CPU reference {dref:.3e}")
     ok = same and dref < 0.5 and all(p.device.type == "cuda" for p in m2.parameters())
+    # export back to a plain BF16 checkpoint: every original parameter must come back bit-identical
+    from nwc import export_bf16
+    from safetensors.torch import load_file
+    e = os.path.join(d, "bf16")
+    export_bf16(d, e, verbose=False)
+    exported = load_file(os.path.join(e, "model.safetensors"))
+    missing = [k for k in state if k not in exported and not (k == "lm_head.weight" and cfg.tie_word_embeddings)]
+    differ = [k for k in state if k in exported and not torch.equal(exported[k].to(state[k].dtype), state[k])]
+    print(f"export: {len(exported)} tensors, missing {missing[:3]}, differing {differ[:3]}")
+    m3 = AutoModelForCausalLM.from_pretrained(e, dtype=torch.bfloat16).eval()
+    with torch.no_grad(): c3 = m3(ids).logits.float().cuda()
+    print(f"exported model logits identical to the original: {torch.equal(c3, ref)}")
+    ok = ok and not missing and not differ and torch.equal(c3, ref)
     print("OK" if ok else "FAIL")
 finally:
     shutil.rmtree(d, ignore_errors=True)

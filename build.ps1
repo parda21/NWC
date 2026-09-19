@@ -1,5 +1,5 @@
 # Builds the CUDA library on Windows: build/nwc_ops.dll (used by the tests and scripts from the repository).
-# Run from the project directory: .\build.ps1 [-Fatbin]   (-Fatbin: sm_80..sm_120 + PTX into nwc/lib for the wheel)
+# Run from the project directory: .\build.ps1 [-Fatbin]   (-Fatbin: sm_75..sm_120 + PTX into nwc/lib for the wheel)
 param([switch]$Fatbin)
 $ErrorActionPreference = "Stop"
 $R = $PSScriptRoot
@@ -8,7 +8,7 @@ $nvcc = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\bin\nvcc.exe"
 New-Item -ItemType Directory -Force "$R\build" | Out-Null
 if ($Fatbin) {
     New-Item -ItemType Directory -Force "$R\nwc\lib" | Out-Null
-    $gen = "-gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 " +
+    $gen = "-gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 " +
            "-gencode arch=compute_90,code=sm_90 -gencode arch=compute_120,code=sm_120 -gencode arch=compute_90,code=compute_90"
     $step = "`"$nvcc`" -O3 --shared -o nwc\lib\nwc_ops.dll csrc\nwc_ops.cu $gen"
 } else {
