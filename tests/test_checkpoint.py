@@ -42,6 +42,18 @@ try:
     with torch.no_grad(): c3 = m3(ids).logits.float().cuda()
     print(f"exported model logits identical to the original: {torch.equal(c3, ref)}")
     ok = ok and not missing and not differ and torch.equal(c3, ref)
+    # fp8 weight-only: convert -> save -> load must reproduce the converted model's logits exactly
+    from nwc.nwc_torch import ELEM
+    if ELEM:
+        m4 = AutoModelForCausalLM.from_pretrained(e, dtype=torch.bfloat16).eval()
+        fuse(m4, elem="fp8"); convert(m4, elem="fp8")
+        with torch.no_grad(): a4 = m4(ids.cuda()).logits.float()
+        d8 = os.path.join(d, "fp8"); save_pretrained(m4, d8, base_model="test"); del m4; torch.cuda.empty_cache()
+        m5 = load_pretrained(d8, verbose=False)
+        with torch.no_grad(): b4 = m5(ids.cuda()).logits.float()
+        same8 = torch.equal(a4, b4); dq = (b4 - ref).abs().max().item()
+        print(f"fp8: logits identical after loading: {same8}; max |d| to the BF16 model {dq:.3e} (quantization, expected > 0)")
+        ok = ok and same8
     print("OK" if ok else "FAIL")
 finally:
     shutil.rmtree(d, ignore_errors=True)

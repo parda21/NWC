@@ -2,6 +2,7 @@
 usage:
   python -m nwc.demo Qwen/Qwen3-4B                     # load, compress, generate 64 tokens (greedy)
   python -m nwc.demo Qwen/Qwen3-4B --native            # comparison: uncompressed
+  python -m nwc.demo Qwen/Qwen3-4B --fp8               # weight-only fp8 (per-channel scale), the fp8 values stored lossless
   python -m nwc.demo Qwen/Qwen3-4B --graph             # also tokens/s as a CUDA graph (no Python overhead)
   python -m nwc.demo Qwen/Qwen3-4B --save Qwen3-4B-NWC # write a compressed checkpoint
   python -m nwc.demo Parda21/Qwen3-4B-NWC --load       # load a compressed checkpoint (local dir or HF repo id)
@@ -15,6 +16,7 @@ def main():
     ap.add_argument("--load", action="store_true", help="model is an NWC checkpoint")
     ap.add_argument("--save", default=None, help="write an NWC checkpoint to this directory")
     ap.add_argument("--native", action="store_true", help="do not compress (comparison)")
+    ap.add_argument("--fp8", action="store_true", help="quantize to weight-only fp8 e4m3 first, then compress the fp8 values")
     ap.add_argument("--no-fusion", action="store_true", help="do not fuse q/k/v and gate/up")
     ap.add_argument("--tokens", type=int, default=64)
     ap.add_argument("--graph", action="store_true", help="time the decode step as a CUDA graph")
@@ -41,8 +43,9 @@ def main():
             model.cuda()
         else:
             from .nwc_torch import convert, fuse
-            if not a.no_fusion: fuse(model)
-            convert(model)
+            elem = "fp8" if a.fp8 else "bf16"
+            if not a.no_fusion: fuse(model, elem=elem)
+            convert(model, elem=elem)
         model.eval()
     print(f"loaded in {time.time()-t0:.0f} s, VRAM in use {torch.cuda.memory_allocated()/1e9:.2f} GB")
     if a.save and not a.native:

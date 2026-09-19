@@ -21,7 +21,8 @@ def _collect(model):
     def key(w):
         if id(w) not in ids:
             ids[id(w)] = len(weights)
-            weights.append({"id": len(weights), "out": w.out_features, "in": w.in_features, "block": w.block, "bytes": w.bytes, "w": w})
+            weights.append({"id": len(weights), "out": w.out_features, "in": w.in_features, "block": w.block, "bytes": w.bytes,
+                            "elem": "fp8" if w.elem else "bf16", "w": w})
         return ids[id(w)]
     groups = set()
     for path, m in model.named_modules():
@@ -99,7 +100,8 @@ def load_pretrained(path: str, device="cuda", verbose=True):
     weights = {}
     for e in config["weights"]:
         t = {n: tensors.pop(f"nwc/{e['id']}/{n}") for n in TENSOR_NAMES}
-        weights[e["id"]] = NWCWeight.from_tensors(e["out"], e["in"], e["block"], t["data"], t["bases"], t["hdr"], t["lut"], t["low"], device)
+        weights[e["id"]] = NWCWeight.from_tensors(e["out"], e["in"], e["block"], t["data"], t["bases"], t["hdr"], t["lut"], t["low"], device,
+                                                  elem=e.get("elem", "bf16"), scale=tensors.pop(f"nwc/{e['id']}/scale", None))
     for m in config["modules"]:
         w = weights[m["weight"]]
         if m["kind"] == "linear":
@@ -139,8 +141,11 @@ def export_bf16(path: str, out: str, device="cuda", verbose=True):
     result, total = {}, 0
     for e in config["weights"]:
         t = {n: tensors.pop(f"nwc/{e['id']}/{n}") for n in TENSOR_NAMES}
-        w = NWCWeight.from_tensors(e["out"], e["in"], e["block"], t["data"], t["bases"], t["hdr"], t["lut"], t["low"], device)
-        full = w.dequant().contiguous().cpu(); del w
+        w = NWCWeight.from_tensors(e["out"], e["in"], e["block"], t["data"], t["bases"], t["hdr"], t["lut"], t["low"], device,
+                                   elem=e.get("elem", "bf16"), scale=tensors.pop(f"nwc/{e['id']}/scale", None))
+        full = w.dequant()
+        if w.scale is not None: full = (full.float() * w.scale[:, None]).to(torch.bfloat16)   # fp8 x scale, rounded to BF16
+        full = full.contiguous().cpu(); del w
         total += full.numel() * 2
         for m in config["modules"]:
             if m["weight"] != e["id"]: continue

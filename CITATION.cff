@@ -6,7 +6,7 @@ authors:
   - family-names: Otto
     given-names: Paul
 type: software
-version: 0.9.1
+version: 0.10.0
 date-released: 2026-09-19
 license: Apache-2.0
 repository-code: "https://github.com/parda21/NWC"

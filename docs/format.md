@@ -105,15 +105,42 @@ the A16. The next lever is a tensor-core path: one `prmt` per pair produces the 
 `mma.m16n8k16` directly, the activations become the B-fragment, accumulation happens in the D-fragment,
 and the reduction and the activation registers disappear.
 
+## 4b. FP8 element type (weight-only fp8 e4m3, format v9 with `elem = 1`)
+
+The same block layout, streams, LUT and decoder serve fp8 weights (`quantize_fp8`: symmetric absmax scale per
+output channel, activations stay BF16; the per-row scale is applied in the finalize kernel). The fp8 byte
+`s e4 m3` is split so that the BF16 decoder needs no new instructions in the hot loop:
+
+| fp8 value | coded symbol (rank prefix code, 10 symbols, no escape) | raw nibble (4-bit plane) |
+|---|---|---|
+| normal, exponent e = 1..15 (NaN rejected) | e >> 1 (8 symbols), LUT byte = 60 + (e >> 1) | (e & 1) << 3 \| mantissa |
+| subnormal m · 2⁻⁹, m ≥ 4 | symbol 0 (fp32 exponent 120) | (m − 4) << 1 |
+| subnormal m = 1, 2, 3 | symbol 8, LUT byte 59 (fp32 exponents 118/119) | 0, 8, 12 |
+| zero | symbol 9, LUT byte 0 | 0 |
+
+The decoded fp32 weight is `[sign | LUT byte | nibble << 4 | 0 | 0]`, i.e. the LUT byte is the fp32 exponent
+field shifted right by one and the nibble carries its low bit plus the three mantissa bits; the sign is coded
+behind the rank code as for BF16. Subnormals and zeros are ordinary symbols (with per-channel scaling they are
+3 % of the weights, far too many for a slow path). The nibble plane has a row stride of `K16 / 2` bytes; within a
+lane's 16 weights the nibbles are ordered so that one shift and one mask turn a raw word into the four weight
+bytes the PRMT expects (word 0 low nibbles = weights 0..3, high nibbles = 4..7, word 1 likewise 8..15).
+Dequantization yields the unscaled fp8 values as BF16 (exact), so `dequant_fp8` recovers the fp8 tensor bit
+for bit.
+
+Size on Qwen3-4B: 6.9 bits per weight, 0.866 of fp8 (`scripts/entropy_quant.py`; an ideal coder on the same
+split reaches 0.862, on the full 4-bit exponent 0.828). int8 was measured and rejected: the rank code reaches
+only 0.95 of int8 because the alphabet is flat; that needs a rANS-class coder.
+
 ## 5. Library interface (`nwc_ops.dll` / `nwc_ops.so`)
 
 | export | purpose |
 |---|---|
 | `nwc_info(i)` | format version, states per lane, table words, header bytes per block, block size |
-| `nwc_layout(M, K, out[4])` | block count, mantissa bytes, scratch floats, `K16` for a shape |
-| `nwc_encode(w, n, K, freq, psym, bases, hdr, data, cap, low)` | host encoder; `psym[0..15]` receives `exp_of_rank` |
-| `nwc_build_tab(freq, psym, tab)` | builds the 4096-entry lookup table |
-| `nwc_linear_bf16(...)` | y = W x + b, x fp32 (`K16`), y BF16; persistent block kernel + finalize |
+| `nwc_layout(M, K, elem, out[4])` | block count, raw-plane bytes, scratch floats, `K16` for a shape |
+| `nwc_encode(w, n, K, elem, freq, psym, bases, hdr, data, cap, low)` | host encoder (BF16 or fp8 bytes); `psym[0..15]` receives `exp_of_rank` |
+| `nwc_build_tab(freq, psym, elem, tab)` | builds the 4096-entry lookup table |
+| `nwc_ref_fp8(...)` | reference fp8 weight-only matvec (bandwidth baseline for the fp8 comparison) |
+| `nwc_linear_bf16(...)` | y = scale · (W x) + b, x fp32 (`K16`), y BF16; persistent block kernel + finalize |
 | `nwc_matvec(...)` | fp32 test path (atomics) |
 | `nwc_dequant(...)` | BF16 row-major output (stride `K16`) |
 | `nwc_gather(...)` | rows by index (embedding lookup) |

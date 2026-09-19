@@ -32,10 +32,11 @@ python -m nwc.build                       # fatbin into nwc/lib (what the wheel 
 | `python tests/test_format_cpu.py` | the library only, **no GPU** | pure-Python reference decoder reproduces the encoder's output bit-exactly (format spec) |
 | `python tests/test_k.py` | GPU, `data/W.raw` (`scripts/make_wraw.py`) | dequantization bit-exact, token path, fp32 path, odd shapes |
 | `python tests/test_gather.py` | GPU, `data/W.raw` | embedding lookup bit-exact |
-| `python tests/test_checkpoint.py` | GPU, `transformers` | save → load → export round trip on a small random model, no download |
+| `python tests/test_checkpoint.py` | GPU, `transformers` | save → load → export round trip on a small random model (BF16 and fp8), no download |
+| `python tests/test_fp8.py` | GPU | fp8 element type: fp8 values bit-exact (dequant, gather), matvec vs float reference, reference kernel, NaN rejected |
 | `python tests/test_nwc_torch.py` | GPU, `data/W.raw` | PyTorch bridge, speed vs cuBLAS on one matrix |
 
-Benchmarks: `scripts/kernbench.py` (kernel vs cuBLAS per layer shape), `scripts/graph_decode.py --mode nwc --fusion`
+Benchmarks: `scripts/kernbench.py` (kernel vs cuBLAS per layer shape; `--elem fp8` against the reference fp8 matvec), `scripts/graph_decode.py --mode nwc --fusion`
 (tokens/s as a CUDA graph), `scripts/compare_df11.py` (against DFloat11). CI (`.github/workflows/ci.yml`) compiles
 the library for every architecture and runs the CPU test; GPU tests are run by hand before a release and the
 output is pasted into the release notes.

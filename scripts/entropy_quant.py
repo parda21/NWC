@@ -66,6 +66,25 @@ for f in files:
             hf = hist_u(f8, 256)
             exp_part = f8 >> 3                       # sign + 4 exponent bits (5 bits), mantissa 3 bits raw
             add("fp8 e4m3 per-channel", n, entropy_bits(hf), prefix_code_bits(hist_u(exp_part, 32)) + 3, 8 + 16 / K)
+            # splits the v9 decoder can do: a small coded alphabet (rank prefix code, <= 16 symbols so no escape) + raw bits
+            # fp8: 4-bit exponent coded, sign + 3-bit mantissa raw (a 4-bit raw plane)
+            e4 = (f8 >> 3) & 0xF
+            he = hist_u(e4, 16)
+            add("  fp8: exp4 coded + 4 raw", n, entropy_bits(he) + 4, prefix_code_bits(he, maxr=16) + 4, 8 + 16 / K)
+            # fp8 as the v9 decoder could run it: symbol = exponent >> 1 (8 symbols + escape for e = 0 / 15), sign coded raw
+            # behind the rank code, low exponent bit + 3-bit mantissa as a raw nibble plane
+            e0 = e4 == 0; e15 = e4 == 15
+            hv = hist_u((e4 >> 1).masked_fill(e0 | e15, 8), 9)
+            esc_frac = (e0 | e15).float().mean().item()
+            add("  fp8: exp>>1 coded + sign + 4 raw", n, entropy_bits(hv) + 5, prefix_code_bits(hv, maxr=8, escape_bits=8) + 5, 8 + 16 / K)
+            add("  fp8: escapes (fraction, x1000)", n, esc_frac * 1000, esc_frac * 1000, 1)
+            # int8 sign-magnitude: top k bits of |q| coded, the rest raw, sign raw
+            mag = (q8 - 128).abs()
+            for k in (7, 6, 5, 4):
+                top = mag >> (7 - k)
+                ht = hist_u(top, 1 << k)
+                maxr = 16 if k <= 4 else 15
+                add(f"  int8: top{k} coded + {8-k} raw", n, entropy_bits(ht) + (8 - k), prefix_code_bits(ht, maxr=maxr, escape_bits=k) + (8 - k), 8 + 16 / K)
             # int4, groups of 128 along K, symmetric absmax
             G = 128
             if K % G == 0:

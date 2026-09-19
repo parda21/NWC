@@ -37,26 +37,56 @@ except AttributeError:            # v7 library: 2 states, main table u32[4096] +
 X_FP32 = VERSION >= 8             # v8+: the token path takes x as fp32
 V9 = VERSION >= 9                 # v9: prefix code, fixed block of 8 rows x 512 columns (any M x K), encoder/dequant need K
 FIXED_BLOCK = _lib.nwc_info(4) if V9 else 0
+ELEM = bool(V9 and _lib.nwc_info(5) == 1)   # element type parameter on every entry point: 0 BF16, 1 FP8 e4m3
+ELEM_BF16, ELEM_FP8 = 0, 1
+ELEMS = {"bf16": ELEM_BF16, "fp8": ELEM_FP8}
+_E = [ctypes.c_int] if ELEM else []
 if V9:
-    _lib.nwc_layout.restype = ctypes.c_int; _lib.nwc_layout.argtypes = [U64, U32, P]
+    _lib.nwc_layout.restype = ctypes.c_int; _lib.nwc_layout.argtypes = [U64, U32] + _E + [P]
 BLOCK_MAX = int(os.environ.get("NWC_BLOCK_MAX", 4096))   # formats < 9: 2048 and 4096 equally fast, 8192 slower (L1 working set)
 _lib.nwc_encode.restype = ctypes.c_int64
-_lib.nwc_encode.argtypes = [P, U64, U32, P, P, P, P, P, U64, P]
-_lib.nwc_build_tab.argtypes = [P, P, P]
+_lib.nwc_encode.argtypes = [P, U64, U32] + _E + [P, P, P, P, P, U64, P]
+_lib.nwc_build_tab.argtypes = [P, P] + _E + [P]
 _lib.nwc_gather.restype = ctypes.c_int
-_lib.nwc_gather.argtypes = [P, P, P, P, P, P, P, U32, P, U64, U32, U32]
+_lib.nwc_gather.argtypes = [P, P, P, P, P, P, P, U32, P, U64, U32, U32] + _E
 _lib.nwc_matvec.restype = ctypes.c_int
-_lib.nwc_matvec.argtypes = [P, P, P, P, P, P, P, P, U64, U32, U32]
+_lib.nwc_matvec.argtypes = [P, P, P, P, P, P, P, P, U64, U32, U32] + _E
 _lib.nwc_dequant.restype = ctypes.c_int
-_lib.nwc_dequant.argtypes = [P, P, P, P, P, P, P, U64, U32] + ([U32] if V9 else [])
+_lib.nwc_dequant.argtypes = [P, P, P, P, P, P, P, U64, U32] + ([U32] if V9 else []) + _E
 _lib.nwc_linear_bf16.restype = ctypes.c_int
-_lib.nwc_linear_bf16.argtypes = [P, P, P, P, P, P, P, P, P, P, U64, U32, U32]
+_lib.nwc_linear_bf16.argtypes = [P, P, P, P, P, P, P, P] + ([P] if ELEM else []) + [P, P, U64, U32, U32] + _E
+if ELEM:
+    _lib.nwc_ref_fp8.restype = ctypes.c_int
+    _lib.nwc_ref_fp8.argtypes = [P, P, P, P, P, U64, U32]
 _lib.nwc_setup.restype = ctypes.c_int
 _lib.nwc_setup()
 
 
 def _ptr(t): return ctypes.c_void_p(t.data_ptr())
 def _stream(): return ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+def _e(elem): return (elem,) if ELEM else ()
+
+
+FP8_MAX = 448.0
+
+
+def quantize_fp8(w: torch.Tensor):
+    """BF16/float [out, in] -> (fp8 e4m3 tensor, fp32 scale[out]): symmetric absmax scaling per output channel
+    (weight-only fp8 as served by vLLM & co; activations stay BF16)."""
+    wf = w.detach().float()
+    scale = wf.abs().amax(dim=1).clamp_min(1e-12) / FP8_MAX
+    q = (wf / scale[:, None]).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    return q, scale
+
+
+def ref_fp8_matvec(w8: torch.Tensor, scale: torch.Tensor, x_f32: torch.Tensor) -> torch.Tensor:
+    """Reference "native" fp8 weight-only matvec in the library (bandwidth baseline): y = scale * (W8 x), y BF16."""
+    M, K = w8.shape
+    y = torch.empty(M, dtype=torch.bfloat16, device=w8.device)
+    xin = x_f32 if x_f32.numel() % 16 == 0 else F.pad(x_f32, (0, 16 - x_f32.numel() % 16))
+    err = _lib.nwc_ref_fp8(_stream(), _ptr(w8.view(torch.uint8)), _ptr(scale), _ptr(xin.contiguous()), _ptr(y), M, K)
+    if err: raise RuntimeError(f"nwc_ref_fp8 CUDA error {err}")
+    return y
 
 
 def fits(out_features, in_features):
@@ -79,20 +109,35 @@ def choose_block(n):
 
 
 class NWCWeight:
-    """Compressed representation of an [out, in] BF16 matrix on the GPU."""
-    def __init__(self, w: torch.Tensor, device="cuda", block=None):
-        assert w.dtype == torch.bfloat16 and w.dim() == 2
+    """Compressed representation of an [out, in] matrix on the GPU.
+    elem "bf16": the BF16 weights, lossless. elem "fp8": weight-only fp8 e4m3 with a per-output-channel fp32 scale
+    (from a BF16 matrix via quantize_fp8, or a float8 tensor plus `scale`), the fp8 values stored lossless."""
+    def __init__(self, w: torch.Tensor, device="cuda", block=None, elem="bf16", scale=None):
+        assert w.dim() == 2
         out_f, in_f = w.shape
         assert fits(out_f, in_f), f"shape {tuple(w.shape)} not supported"
+        self.elem = ELEMS[elem]
+        if self.elem == ELEM_FP8:
+            if not ELEM: raise RuntimeError("this NWC library has no fp8 support")
+            if w.dtype == torch.float8_e4m3fn:
+                if scale is None: raise ValueError("fp8 weights need their per-row scale")
+                q = w
+            else:
+                q, scale = quantize_fp8(w)
+            src = q.detach().contiguous().cpu().view(torch.uint8)
+            self.scale = scale.detach().float().contiguous().to(device)
+        else:
+            assert w.dtype == torch.bfloat16, "BF16 expected (elem='fp8' for fp8 weights)"
+            src = w.detach().contiguous().cpu().view(torch.int16)
+            self.scale = None
         n = out_f * in_f
         block = block or choose_block(n)
-        if V9:                                                     # blocks, mantissa bytes (stride K16), scratch, K16 from the library
+        if V9:                                                     # blocks, raw-plane bytes, scratch, K16 from the library
             lay = torch.empty(4, dtype=torch.int64)
-            if _lib.nwc_layout(out_f, in_f, _ptr(lay)): raise RuntimeError("nwc_layout")
+            if _lib.nwc_layout(out_f, in_f, *_e(self.elem), _ptr(lay)): raise RuntimeError("nwc_layout")
             nb, n_low, n_scratch, self.K16 = lay.tolist()
         else:
             nb, n_low, n_scratch, self.K16 = n // block, n, out_f * (in_f // block + 2), in_f
-        w16 = w.detach().contiguous().cpu().view(torch.int16)
         freq = torch.empty(NPAIR, dtype=torch.int16)               # v8: pair frequencies; v9: unused
         psym = torch.empty(NPAIR, dtype=torch.int16)               # v8: index -> two exponent bytes; v9: exp_of_rank[16]
         bases = torch.empty(nb, dtype=torch.int32)
@@ -100,43 +145,52 @@ class NWCWeight:
         low = torch.empty(n_low, dtype=torch.uint8)
         for cap in (n + n // 2 + nb * 64 + 4096, 3 * n + nb * 64 + 4096):   # 12 bits per weight is practically always enough
             data = torch.empty(cap, dtype=torch.uint8)
-            dl = _lib.nwc_encode(_ptr(w16), n, in_f if V9 else block, _ptr(freq), _ptr(psym), _ptr(bases), _ptr(hdr), _ptr(data), cap, _ptr(low))
-            if dl >= 0: break
+            dl = _lib.nwc_encode(_ptr(src), n, in_f if V9 else block, *_e(self.elem), _ptr(freq), _ptr(psym), _ptr(bases), _ptr(hdr), _ptr(data), cap, _ptr(low))
+            if dl >= 0 or dl == -2: break
+        if dl == -2: raise ValueError("fp8 weights contain NaN")
         if dl < 0: raise RuntimeError("nwc_encode failed")
         lut = torch.empty(TAB_WORDS, dtype=torch.int32)
-        _lib.nwc_build_tab(_ptr(freq), _ptr(psym), _ptr(lut))
+        _lib.nwc_build_tab(_ptr(freq), _ptr(psym), *_e(self.elem), _ptr(lut))
         self.out_features, self.in_features, self.n, self.block = out_f, in_f, n, block
         self.data = data[:dl + 64].clone().to(device)
         self.bases = bases.to(device)
         self.hdr = hdr.to(device)
         self.lut = lut.to(device)
         self.low = low.to(device)
-        self.bytes = dl + self.bases.numel() * 4 + self.hdr.numel() + self.lut.numel() * 4 + n_low
-        self.bytes_bf16 = 2 * n
+        self._finish(dl, n_low, n_scratch, device)
+
+    def _finish(self, dl, n_low, n_scratch, device):
+        n = self.n
+        self.bytes = dl + self.bases.numel() * 4 + self.hdr.numel() + self.lut.numel() * 4 + n_low + (self.scale.numel() * 4 if self.scale is not None else 0)
+        self.bytes_bf16 = 2 * n                                    # size of the BF16 original
+        self.bytes_native = n + self.out_features * 4 if self.elem == ELEM_FP8 else 2 * n   # size of the uncompressed input format
         self.scratch = torch.empty(n_scratch, dtype=torch.float32, device=device)
 
     @classmethod
-    def from_tensors(cls, out_f, in_f, block, data, bases, hdr, lut, low, device="cuda"):
-        """Compressed representation from stored tensors (nwc.checkpoint), without the BF16 originals."""
+    def from_tensors(cls, out_f, in_f, block, data, bases, hdr, lut, low, device="cuda", elem="bf16", scale=None):
+        """Compressed representation from stored tensors (nwc.checkpoint), without the originals."""
         self = cls.__new__(cls)
+        self.elem = ELEMS[elem]
+        if self.elem == ELEM_FP8 and not ELEM: raise RuntimeError("this NWC library has no fp8 support")
         n = out_f * in_f
         if V9:
             lay = torch.empty(4, dtype=torch.int64)
-            if _lib.nwc_layout(out_f, in_f, _ptr(lay)): raise RuntimeError("nwc_layout")
+            if _lib.nwc_layout(out_f, in_f, *_e(self.elem), _ptr(lay)): raise RuntimeError("nwc_layout")
             nb, n_low, n_scratch, self.K16 = lay.tolist()
         else:
             nb, n_low, n_scratch, self.K16 = n // block, n, out_f * (in_f // block + 2), in_f
         if bases.numel() != nb or low.numel() != n_low: raise ValueError("checkpoint does not match this library version")
         self.out_features, self.in_features, self.n, self.block = out_f, in_f, n, block
         self.data, self.bases, self.hdr, self.lut, self.low = (t.to(device) for t in (data, bases, hdr, lut, low))
-        self.bytes = self.data.numel() + self.bases.numel() * 4 + self.hdr.numel() + self.lut.numel() * 4 + n_low
-        self.bytes_bf16 = 2 * n
-        self.scratch = torch.empty(n_scratch, dtype=torch.float32, device=device)
+        self.scale = None if scale is None else scale.float().to(device)
+        self._finish(self.data.numel(), n_low, n_scratch, device)
         return self
 
     def tensors(self):
-        """The five tensors that fully describe the compressed state (for nwc.checkpoint)."""
-        return {"data": self.data, "bases": self.bases, "hdr": self.hdr, "lut": self.lut, "low": self.low}
+        """The tensors that fully describe the compressed state (for nwc.checkpoint)."""
+        t = {"data": self.data, "bases": self.bases, "hdr": self.hdr, "lut": self.lut, "low": self.low}
+        if self.scale is not None: t["scale"] = self.scale
+        return t
 
     def _x16(self, x_f32):
         """v9: extend x to K16 (multiple of 16) with zeros if K is not one."""
@@ -147,18 +201,19 @@ class NWCWeight:
         y = torch.empty(self.out_features, dtype=torch.float32, device=x_f32.device)
         xin = self._x16(x_f32.contiguous())
         err = _lib.nwc_matvec(_stream(), _ptr(self.data), _ptr(self.bases), _ptr(self.hdr), _ptr(self.lut),
-                              _ptr(self.low), _ptr(xin), _ptr(y), self.n, self.block, self.in_features)
+                              _ptr(self.low), _ptr(xin), _ptr(y), self.n, self.block, self.in_features, *_e(self.elem))
         if err: raise RuntimeError(f"nwc_matvec CUDA error {err}")
-        return y
+        return y if self.scale is None else y * self.scale
 
     def linear_bf16(self, x: torch.Tensor, bias) -> torch.Tensor:
-        """Token path: y = W x + bias, x BF16 or fp32, y BF16."""
+        """Token path: y = scale * (W x) + bias, x BF16 or fp32, y BF16."""
         y = torch.empty(self.out_features, dtype=torch.bfloat16, device=x.device)
         xin = (x if x.dtype == torch.float32 else x.float()) if X_FP32 else x   # v8+: x fp32
         if V9: xin = self._x16(xin)
         err = _lib.nwc_linear_bf16(_stream(), _ptr(self.data), _ptr(self.bases), _ptr(self.hdr), _ptr(self.lut),
                                    _ptr(self.low), _ptr(xin), _ptr(bias) if bias is not None else None,
-                                   _ptr(self.scratch), _ptr(y), self.n, self.block, self.in_features)
+                                   *((_ptr(self.scale) if self.scale is not None else None,) if ELEM else ()),
+                                   _ptr(self.scratch), _ptr(y), self.n, self.block, self.in_features, *_e(self.elem))
         if err: raise RuntimeError(f"nwc_linear_bf16 CUDA error {err}")
         return y
 
@@ -167,25 +222,31 @@ class NWCWeight:
         flat = ids.reshape(-1).to(device=self.data.device, dtype=torch.int64).contiguous()
         out = torch.empty(flat.numel(), self.K16, dtype=torch.bfloat16, device=self.data.device)
         err = _lib.nwc_gather(_stream(), _ptr(self.data), _ptr(self.bases), _ptr(self.hdr), _ptr(self.lut),
-                              _ptr(self.low), _ptr(flat), flat.numel(), _ptr(out), self.n, self.block, self.in_features)
+                              _ptr(self.low), _ptr(flat), flat.numel(), _ptr(out), self.n, self.block, self.in_features, *_e(self.elem))
         if err: raise RuntimeError(f"nwc_gather CUDA error {err}")
         if self.K16 != self.in_features: out = out[:, :self.in_features].contiguous()
         return out.view(*ids.shape, self.in_features)
 
     def dequant(self) -> torch.Tensor:
-        """The full BF16 matrix (row-major); a view with row stride K16 if K is not a multiple of 16."""
+        """The full matrix as BF16 (row-major); a view with row stride K16 if K is not a multiple of 16.
+        fp8: the unscaled fp8 values (exact in BF16); multiply rows by `scale` for the weights."""
         w = torch.empty((self.out_features, self.K16), dtype=torch.bfloat16, device=self.data.device)
         err = _lib.nwc_dequant(_stream(), _ptr(self.data), _ptr(self.bases), _ptr(self.hdr), _ptr(self.lut),
-                               _ptr(self.low), _ptr(w), self.n, self.block, *((self.in_features,) if V9 else ()))
+                               _ptr(self.low), _ptr(w), self.n, self.block, *((self.in_features,) if V9 else ()), *_e(self.elem))
         if err: raise RuntimeError(f"nwc_dequant CUDA error {err}")
         return w if self.K16 == self.in_features else w[:, :self.in_features]
 
+    def dequant_fp8(self):
+        """fp8 weights: (float8_e4m3fn tensor [out, in], fp32 scale[out]), bit-exact with what was encoded."""
+        if self.elem != ELEM_FP8: raise ValueError("not an fp8 matrix")
+        return self.dequant().to(torch.float8_e4m3fn), self.scale
+
 
 class NWCLinear(nn.Module):
-    """Drop-in replacement for nn.Linear on a compressed matrix."""
-    def __init__(self, linear: nn.Linear = None, device="cuda", block=None, w: "NWCWeight" = None, bias=None):
+    """Drop-in replacement for nn.Linear on a compressed matrix (elem "bf16" lossless, or "fp8" weight-only)."""
+    def __init__(self, linear: nn.Linear = None, device="cuda", block=None, w: "NWCWeight" = None, bias=None, elem="bf16"):
         super().__init__()
-        self.w = w if w is not None else NWCWeight(linear.weight.data, device, block)
+        self.w = w if w is not None else NWCWeight(linear.weight.data, device, block, elem=elem)
         self.in_features, self.out_features = self.w.in_features, self.w.out_features
         if linear is not None and linear.bias is not None: bias = linear.bias.data
         self.bias = None if bias is None else nn.Parameter(bias.to(device=device, dtype=torch.bfloat16), requires_grad=False)
@@ -195,10 +256,13 @@ class NWCLinear(nn.Module):
             xf = x if x.is_contiguous() else x.contiguous()
             y = self.w.linear_bf16(xf.view(-1), None if self.bias is None else self.bias.data)
             return y.view(*x.shape[:-1], self.out_features)
-        return F.linear(x, self.w.dequant(), self.bias)         # prefill -> temporary dequantization
+        if self.w.scale is None: return F.linear(x, self.w.dequant(), self.bias)   # prefill -> temporary dequantization
+        y = F.linear(x, self.w.dequant()).float() * self.w.scale                    # fp8: unscaled matmul, then the row scale
+        if self.bias is not None: y = y + self.bias.float()
+        return y.to(x.dtype)
 
     def extra_repr(self):
-        return (f"in={self.in_features}, out={self.out_features}, block={self.w.block}, "
+        return (f"in={self.in_features}, out={self.out_features}, elem={'fp8' if self.w.elem else 'bf16'}, "
                 f"{self.w.bytes/1e6:.1f} MB (BF16: {self.w.bytes_bf16/1e6:.1f} MB)")
 
 
@@ -211,7 +275,9 @@ class NWCEmbedding(nn.Module):
         self.padding_idx = emb.padding_idx if emb is not None else padding_idx
 
     def forward(self, ids):
-        return self.w.gather(ids)
+        rows = self.w.gather(ids)
+        if self.w.scale is None: return rows
+        return (rows.float() * self.w.scale[ids.to(self.w.scale.device)][..., None]).to(torch.bfloat16)
 
     def extra_repr(self):
         return f"{self.num_embeddings}, {self.embedding_dim}, {self.w.bytes/1e6:.1f} MB (BF16: {self.w.bytes_bf16/1e6:.1f} MB)"
@@ -230,7 +296,7 @@ class _FusedHead(nn.Module):
         return g["y"][..., self.start:self.end]
 
 
-def fuse(model: nn.Module, groups=(("q_proj", "k_proj", "v_proj"), ("gate_proj", "up_proj")), device="cuda"):
+def fuse(model: nn.Module, groups=(("q_proj", "k_proj", "v_proj"), ("gate_proj", "up_proj")), device="cuda", elem="bf16"):
     """Concatenate sibling nn.Linear layers with the same input into one NWC matrix (fewer, larger kernel launches).
     Call before `convert`; the fused layers are NWC afterwards. Returns the number of fused groups."""
     n_fused = 0
@@ -248,7 +314,7 @@ def fuse(model: nn.Module, groups=(("q_proj", "k_proj", "v_proj"), ("gate_proj",
             whole = nn.Linear(W.shape[1], W.shape[0], bias=b is not None, dtype=torch.bfloat16)
             whole.weight.data = W
             if b is not None: whole.bias.data = b
-            lin = NWCLinear(whole, device)
+            lin = NWCLinear(whole, device, elem=elem)
             shared = {"lin": lin, "y": None, "x_id": None, "names": list(names), "sizes": [l.out_features for l in lins]}
             a = 0
             for i, (nm, l) in enumerate(zip(names, lins)):
@@ -259,8 +325,9 @@ def fuse(model: nn.Module, groups=(("q_proj", "k_proj", "v_proj"), ("gate_proj",
     return n_fused
 
 
-def convert(model: nn.Module, device="cuda", verbose=True, tied=True):
+def convert(model: nn.Module, device="cuda", verbose=True, tied=True, elem="bf16"):
     """Replace every supported nn.Linear (and a tied embedding) by NWC modules; move the rest to `device`.
+    elem "bf16": lossless; "fp8": weight-only fp8 e4m3 (per-channel scale), the fp8 values stored lossless.
     Returns (bytes_nwc, bytes_bf16) of the compressed matrices."""
     total_nwc = total_bf16 = 0
     replaced, skipped, blocks = 0, [], {}
@@ -273,7 +340,7 @@ def convert(model: nn.Module, device="cuda", verbose=True, tied=True):
                 if isinstance(cm, nn.Linear) and cm.weight.data_ptr() in embs]
         for name, mod, child, cm in lins:
             emb = embs[cm.weight.data_ptr()]
-            w = NWCWeight(emb.weight.data, device)
+            w = NWCWeight(emb.weight.data, device, elem=elem)
             setattr(mod, child, NWCLinear(cm, device, w=w))
             for ename, emod in list(model.named_modules()):
                 for echild, ecm in list(emod.named_children()):
@@ -290,7 +357,7 @@ def convert(model: nn.Module, device="cuda", verbose=True, tied=True):
         for child, cm in list(mod.named_children()):
             if isinstance(cm, nn.Linear) and cm.weight.dtype == torch.bfloat16 \
                and fits(cm.out_features, cm.in_features) and cm.weight.data_ptr() not in shared_ptrs:
-                new = NWCLinear(cm, device)
+                new = NWCLinear(cm, device, elem=elem)
                 setattr(mod, child, new)
                 total_nwc += new.w.bytes; total_bf16 += new.w.bytes_bf16; replaced += 1
                 blocks[new.w.block] = blocks.get(new.w.block, 0) + 1
@@ -300,7 +367,7 @@ def convert(model: nn.Module, device="cuda", verbose=True, tied=True):
                 skipped.append(f"{name}.{child} {tuple(cm.weight.shape)} [{reason}]")
     model.to(device)
     if verbose:
-        print(f"NWC: {replaced} linear layers replaced, {total_bf16/1e9:.2f} GB BF16 -> {total_nwc/1e9:.2f} GB "
-              f"(ratio {total_nwc/max(total_bf16,1):.4f}); block sizes: {dict(sorted(blocks.items()))}")
+        print(f"NWC ({elem}): {replaced} linear layers replaced, {total_bf16/1e9:.2f} GB BF16 -> {total_nwc/1e9:.2f} GB "
+              f"(ratio {total_nwc/max(total_bf16,1):.4f}" + (f", vs fp8 {total_nwc/max(total_bf16/2,1):.3f}" if elem == "fp8" else "") + ")")
         if skipped: print("  skipped:", ", ".join(skipped[:6]), "..." if len(skipped) > 6 else "")
     return total_nwc, total_bf16
